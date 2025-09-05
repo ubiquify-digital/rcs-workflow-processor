@@ -1,0 +1,33 @@
+[Unit]
+Description=Video Processing API - AI-powered video analysis with object detection and OCR
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/workflows
+Environment=PATH=/home/ubuntu/workflows/venv/bin
+ExecStart=/home/ubuntu/workflows/venv/bin/python video_processing_api.py
+Restart=always
+RestartSec=3
+
+# Load environment variables from .env file
+EnvironmentFile=/home/ubuntu/workflows/.env
+
+# Security settings
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+# Resource limits
+LimitNOFILE=65536
+TimeoutStartSec=60
+TimeoutStopSec=30
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=video-processing-api
+
+[Install]
+WantedBy=multi-user.target
