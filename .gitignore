@@ -95,3 +95,7 @@ coverage.xml
 .mypy_cache/
 .dmypy.json
 dmypy.json
+
+node_modules/
+package-lock.json
+package.json
