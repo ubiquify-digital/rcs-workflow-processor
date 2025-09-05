@@ -149,8 +149,10 @@ class VideoProcessor:
                     cv2.imwrite(frame_path, result["car_model_predictions"].numpy_image)    
                 elif result.get("license_plate_model_predictions"):
                     cv2.imwrite(frame_path, result["license_plate_model_predictions"].numpy_image)
-                else:
+                elif result.get("label_visualization"):
                     cv2.imwrite(frame_path, result["label_visualization"].numpy_image)
+                else:
+                    cv2.imwrite(frame_path, result["fallback_visual"].numpy_image)
 
             # Serialize the result
             serializable_result = self.make_serializable(result)
