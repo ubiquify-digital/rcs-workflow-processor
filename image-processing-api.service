@@ -1,0 +1,33 @@
+[Unit]
+Description=Image Processing API - AI-powered drone image analysis with GPS extraction and object detection
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/workflows
+Environment=PATH=/home/ubuntu/workflows/ienv/bin
+ExecStart=/home/ubuntu/workflows/ienv/bin/python image_processing_api.py
+Restart=always
+RestartSec=3
+
+# Load environment variables from .env file
+EnvironmentFile=/home/ubuntu/workflows/.env
+
+# Security settings
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+# Resource limits
+LimitNOFILE=65536
+TimeoutStartSec=60
+TimeoutStopSec=30
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=image-processing-api
+
+[Install]
+WantedBy=multi-user.target
