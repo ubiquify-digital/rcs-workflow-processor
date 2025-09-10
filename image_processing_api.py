@@ -125,10 +125,9 @@ class EnrichedCompareResponse(BaseModel):
 
 class SrtGenerateRequest(BaseModel):
     task_id: str
-    video_duration_seconds: int = 196
-    fps: int = 1  # Subtitles per second
     font_size: int = 28
     coordinate_precision: int = 6  # Decimal places for coordinates
+
 
 class SrtGenerateResponse(BaseModel):
     srt_content: str
@@ -137,6 +136,7 @@ class SrtGenerateResponse(BaseModel):
     gps_range: Dict[str, Dict[str, float]]  # lat/lon min/max
     images_used: int
     interpolated_points: int
+
 
 class DumpingViolation(BaseModel):
     cluster_id: int
@@ -383,8 +383,8 @@ def format_srt_time(seconds: float) -> str:
     millisecs = int((seconds % 1) * 1000)
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millisecs:03d}"
 
-def generate_srt_content(images: List[dict], video_duration: int, fps: int = 1, font_size: int = 28, precision: int = 6) -> Tuple[str, dict]:
-    """Generate SRT subtitle content from image GPS data"""
+def generate_srt_content(images: List[dict], font_size: int = 28, precision: int = 6) -> Tuple[str, dict]:
+    """Generate SRT subtitle content from image GPS data - one entry per image"""
     from datetime import datetime, timedelta
     
     # Extract GPS data with timestamps
@@ -400,7 +400,8 @@ def generate_srt_content(images: List[dict], video_duration: int, fps: int = 1, 
                 
                 lat = float(img['latitude'])
                 lon = float(img['longitude'])
-                gps_data.append((dt, lat, lon))
+                filename = img.get('filename', 'unknown')
+                gps_data.append((dt, lat, lon, filename))
             except (ValueError, TypeError) as e:
                 logger.warning(f"Error parsing timestamp or coordinates for image {img.get('filename', 'unknown')}: {e}")
                 continue
@@ -410,22 +411,17 @@ def generate_srt_content(images: List[dict], video_duration: int, fps: int = 1, 
     
     # Sort by timestamp
     gps_data.sort(key=lambda x: x[0])
-    start_time = gps_data[0][0]
     
-    # Generate SRT entries
+    # Generate SRT entries - one per image
     srt_entries = []
-    interpolated_count = 0
-    interval = 1.0 / fps  # Time between subtitles
+    num_images = len(gps_data)
     
-    for i in range(int(video_duration * fps)):
-        # Calculate target time for this subtitle
+    # Fixed duration: 1 second per image
+    interval = 1.0
+    
+    for i, (dt, lat, lon, filename) in enumerate(gps_data):
+        # Calculate timing for this image
         seconds_offset = i * interval
-        target_time = start_time + timedelta(seconds=seconds_offset)
-        
-        # Interpolate GPS coordinates
-        lat, lon = interpolate_coordinates(gps_data, target_time)
-        if lat != gps_data[0][1] or lon != gps_data[0][2]:  # Check if interpolated
-            interpolated_count += 1
         
         # Create SRT entry
         entry_num = i + 1
@@ -458,10 +454,14 @@ def generate_srt_content(images: List[dict], video_duration: int, fps: int = 1, 
         }
     }
     
+    # Calculate total video duration (1 second per image)
+    total_duration = num_images * 1.0
+    
     stats = {
         "images_used": len(gps_data),
-        "interpolated_points": interpolated_count,
-        "gps_range": gps_range
+        "interpolated_points": 0,  # No interpolation needed since we use actual image data
+        "gps_range": gps_range,
+        "total_duration_seconds": total_duration
     }
     
     return ''.join(srt_entries), stats
@@ -1511,11 +1511,15 @@ async def analyze_multifolder_dumping(request: MultifolderAnalysisRequest):
                         violations.append(violation)
                         analysis_summary[violation_type] += 1
                         
+                        # NOTE: Commented out breaks to find ALL violations in each cluster
+                        # Previously this would stop after finding first violation per cluster
                         # Break after finding first violation in this cluster to avoid duplicates
-                        break
+                        # break
                     
-                if violations and violations[-1].cluster_id == cluster['id']:
-                    break  # Found violation in this cluster, move to next cluster
+                # NOTE: Commented out cluster-level break to find ALL violations
+                # Previously this would skip to next cluster after finding any violation
+                # if violations and violations[-1].cluster_id == cluster['id']:
+                #     break  # Found violation in this cluster, move to next cluster
         
         # Sort violations by time difference (most recent first)
         violations.sort(key=lambda x: x.time_difference_minutes, reverse=True)
@@ -1554,25 +1558,23 @@ async def generate_srt_for_folder(task_id: str, request: SrtGenerateRequest):
         if not images:
             raise HTTPException(status_code=404, detail=f"No images found for task_id: {task_id}")
         
-        logger.info(f"Generating SRT for {len(images)} images, duration: {request.video_duration_seconds}s at {request.fps}fps")
+        logger.info(f"Generating SRT for {len(images)} images, 1s per image")
         
         # Generate SRT content
         srt_content, stats = generate_srt_content(
             images=images,
-            video_duration=request.video_duration_seconds,
-            fps=request.fps,
             font_size=request.font_size,
             precision=request.coordinate_precision
         )
         
-        total_entries = request.video_duration_seconds * request.fps
+        total_entries = stats['images_used']  # Now one entry per image
         
         logger.info(f"Generated SRT with {total_entries} entries from {stats['images_used']} images")
         
         return SrtGenerateResponse(
             srt_content=srt_content,
             total_entries=total_entries,
-            duration_seconds=request.video_duration_seconds,
+            duration_seconds=int(stats['total_duration_seconds']),
             gps_range=stats['gps_range'],
             images_used=stats['images_used'],
             interpolated_points=stats['interpolated_points']
@@ -1583,6 +1585,7 @@ async def generate_srt_for_folder(task_id: str, request: SrtGenerateRequest):
     except Exception as e:
         logger.error(f"Error generating SRT: {str(e)}")
         raise HTTPException(status_code=500, detail=f"SRT generation error: {str(e)}")
+
 
 @app.get("/folders/{task_id}")
 async def get_folder_details(task_id: str):
