@@ -1364,10 +1364,48 @@ async def root():
 
 @app.get("/folders")
 async def get_processed_folders():
-    """Get list of all processed folders"""
+    """Get list of all processed folders sorted by timestamp (oldest first)"""
     try:
-        result = supabase.table('processed_folders').select('*').order('created_at', desc=True).execute()
-        return {"folders": result.data}
+        result = supabase.table('processed_folders').select('*').execute()
+        
+        # Sort by timestamp extracted from folder names (oldest first)
+        def get_folder_timestamp(folder_info):
+            try:
+                folder_name = folder_info.get('folder_name', '')
+                if folder_name.startswith('Run '):
+                    # Parse "Run September 10 6:40 AM" format
+                    try:
+                        # Remove "Run " prefix
+                        name_part = folder_name[4:]
+                        # Split into parts: "September 10 6:40 AM"
+                        parts = name_part.split()
+                        if len(parts) >= 4:
+                            month_name = parts[0]
+                            day = parts[1]
+                            time_part = ' '.join(parts[2:])  # "6:40 AM"
+                            
+                            # Convert to datetime for sorting
+                            from datetime import datetime
+                            current_year = datetime.now().year
+                            dt_str = f"{current_year} {month_name} {day} {time_part}"
+                            dt = datetime.strptime(dt_str, "%Y %B %d %I:%M %p")
+                            return dt
+                    except Exception as e:
+                        logger.warning(f"Error parsing folder name timestamp '{folder_name}': {e}")
+                
+                # Fallback: return epoch time (will sort to beginning)
+                from datetime import datetime
+                return datetime(1970, 1, 1)
+                
+            except Exception as e:
+                logger.warning(f"Error extracting timestamp for folder: {e}")
+                from datetime import datetime
+                return datetime(1970, 1, 1)
+        
+        # Sort by timestamp (oldest first)
+        sorted_folders = sorted(result.data, key=get_folder_timestamp, reverse=False)
+        
+        return {"folders": sorted_folders}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching folders: {str(e)}")
 
@@ -1774,9 +1812,12 @@ async def analyze_multifolder_dumping(request: MultifolderAnalysisRequest):
                             elif violation_type == "additional_dumping":
                                 updated_description = f"Car [{license_plate}] dumped additional {trash_count} trash item(s)"
                             else:
+                                # remove "🚗🗑️ DUMPING DETECTED" from summary
+                                updated_description = summary.replace("🚗🗑️ DUMPING DETECTED: ", "")
                                 updated_description = summary
                         else:
-                            updated_description = summary
+                            # remove "🚗🗑️ DUMPING DETECTED" from summary
+                            updated_description = summary.replace("🚗🗑️ DUMPING DETECTED: ", "")
                         
                         # Add signed URLs
                         img1_with_urls = add_signed_urls_to_images([img1])[0]
@@ -2075,8 +2116,42 @@ async def list_s3_folders(bucket: str = "rcsstoragebucket", prefix: str = "fh_sy
             
             folders_with_status.append(folder_info)
         
-        # Sort by folder name
-        folders_with_status.sort(key=lambda x: x['folder_name'])
+        # Sort by timestamp (extracted from folder names)
+        def get_folder_timestamp(folder_info):
+            try:
+                folder_name = folder_info['folder_name']
+                if folder_name.startswith('Run '):
+                    # Parse "Run September 10 6:40 AM" format
+                    try:
+                        # Remove "Run " prefix
+                        name_part = folder_name[4:]
+                        # Split into parts: "September 10 6:40 AM"
+                        parts = name_part.split()
+                        if len(parts) >= 4:
+                            month_name = parts[0]
+                            day = parts[1]
+                            time_part = ' '.join(parts[2:])  # "6:40 AM"
+                            
+                            # Convert to datetime for sorting
+                            from datetime import datetime
+                            current_year = datetime.now().year
+                            dt_str = f"{current_year} {month_name} {day} {time_part}"
+                            dt = datetime.strptime(dt_str, "%Y %B %d %I:%M %p")
+                            return dt
+                    except Exception as e:
+                        logger.warning(f"Error parsing folder name timestamp '{folder_name}': {e}")
+                
+                # Fallback: return epoch time (will sort to beginning)
+                from datetime import datetime
+                return datetime(1970, 1, 1)
+                
+            except Exception as e:
+                logger.warning(f"Error extracting timestamp for folder: {e}")
+                from datetime import datetime
+                return datetime(1970, 1, 1)
+        
+        # Sort by timestamp (oldest first)
+        folders_with_status.sort(key=get_folder_timestamp, reverse=False)
         
         return {
             "bucket": bucket,

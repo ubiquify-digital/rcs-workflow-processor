@@ -1,0 +1,22 @@
+[Unit]
+Description=Inference Server Monitor
+After=network.target
+Wants=image-processing-api.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/workflows
+ExecStart=/usr/bin/python3 /home/ubuntu/workflows/inference-server-monitor.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Environment variables
+Environment=PYTHONPATH=/home/ubuntu/workflows
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
