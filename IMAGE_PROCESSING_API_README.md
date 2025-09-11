@@ -83,6 +83,28 @@ http://13.48.174.160:8001
 }
 ```
 
+#### `POST /rerun-folder`
+**Rerun processing for a folder (useful when initial processing fails)**
+- **Request Body:**
+```json
+{
+  "s3_folder_url": "s3://rcsstoragebucket/djiimages/1/"
+}
+```
+- **Response:**
+```json
+{
+  "task_id": "uuid",
+  "status": "queued",
+  "message": "Rerun processing started for folder. Use /status/{task_id} to check progress."
+}
+```
+- **Features:**
+  - Automatically cleans up previous processing data
+  - Validates S3 folder exists before processing
+  - Generates fresh task ID for new processing
+  - Handles partial failures and data corruption
+
 ### 📁 **Data Retrieval**
 
 #### `GET /folders`

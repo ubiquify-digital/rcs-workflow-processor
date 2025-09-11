@@ -1056,10 +1056,23 @@ def count_images_in_s3_folder(s3_folder_url: str) -> int:
         if 'Contents' not in response:
             return 0
         
-        # Count image files
+        # Count image files (only in the specific folder, not subfolders)
         image_count = 0
         for obj in response['Contents']:
             key = obj['Key']
+            
+            # Skip if this is a subfolder (contains additional path separators after the folder prefix)
+            # Handle folder prefix with or without trailing slash
+            if folder_prefix.endswith('/'):
+                relative_path = key[len(folder_prefix):]
+            else:
+                relative_path = key[len(folder_prefix + '/'):] if key.startswith(folder_prefix + '/') else key[len(folder_prefix):]
+            
+            # Skip if this is in a subfolder (relative path contains slashes)
+            if '/' in relative_path:
+                continue  # Skip subfolders
+            
+            # Count only image files directly in this folder
             if key.lower().endswith(('.jpg', '.jpeg', '.png', '.tiff', '.tif')):
                 image_count += 1
         
@@ -1247,6 +1260,83 @@ async def process_folder_endpoint(request: ImageFolderProcessRequest, background
     except Exception as e:
         logger.error(f"Error starting image processing: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/rerun-folder", response_model=ImageProcessResponse)
+async def rerun_folder_endpoint(request: ImageFolderProcessRequest, background_tasks: BackgroundTasks):
+    """Rerun processing for a folder (useful when initial processing fails)"""
+    try:
+        # Check if folder exists in S3
+        s3_parts = request.s3_folder_url.replace('s3://', '').rstrip('/').split('/', 1)
+        bucket = s3_parts[0]
+        folder_prefix = s3_parts[1] if len(s3_parts) > 1 else ''
+        
+        s3_client = boto3.client('s3')
+        try:
+            response = s3_client.list_objects_v2(
+                Bucket=bucket,
+                Prefix=folder_prefix,
+                MaxKeys=1
+            )
+            if 'Contents' not in response:
+                raise HTTPException(status_code=404, detail=f"S3 folder not found: {request.s3_folder_url}")
+        except Exception as e:
+            raise HTTPException(status_code=404, detail=f"Error accessing S3 folder: {str(e)}")
+        
+        # Check if folder was previously processed
+        existing_folders = supabase.table('processed_folders').select('*').eq('s3_input_folder_url', request.s3_folder_url).execute()
+        
+        # Clean up previous processing data if it exists
+        if existing_folders.data:
+            logger.info(f"Cleaning up previous processing data for folder: {request.s3_folder_url}")
+            
+            # Get the task_id from previous processing
+            old_task_id = existing_folders.data[0]['task_id']
+            
+            # Delete processed images
+            supabase.table('processed_images').delete().eq('task_id', old_task_id).execute()
+            
+            # Delete processed folder record
+            supabase.table('processed_folders').delete().eq('s3_input_folder_url', request.s3_folder_url).execute()
+            
+            # Remove from tasks if still in memory
+            if old_task_id in tasks:
+                del tasks[old_task_id]
+            
+            logger.info(f"Cleaned up previous processing data for task_id: {old_task_id}")
+        
+        # Generate new unique task ID
+        task_id = str(uuid.uuid4())
+        
+        # Initialize new task
+        tasks[task_id] = {
+            "status": "queued",
+            "progress": None,
+            "processed_images": 0,
+            "successful_images": 0,
+            "failed_images": 0,
+            "total_images": None,
+            "s3_output_folder_url": None,
+            "error": None,
+            "created_at": datetime.now().isoformat()
+        }
+        
+        # Create processor and start background task
+        processor = ImageProcessor(task_id, request.s3_folder_url)
+        background_tasks.add_task(processor.process_folder, request.s3_folder_url)
+        
+        logger.info(f"Rerun processing started for folder: {request.s3_folder_url} with task_id: {task_id}")
+        
+        return ImageProcessResponse(
+            task_id=task_id,
+            status="queued",
+            message=f"Rerun processing started for folder. Use /status/{task_id} to check progress."
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error starting rerun processing: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error starting rerun processing: {str(e)}")
 
 @app.get("/status/{task_id}", response_model=TaskStatus)
 async def get_task_status(task_id: str):
