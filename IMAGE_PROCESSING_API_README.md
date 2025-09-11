@@ -105,6 +105,33 @@ http://13.48.174.160:8001
   - Generates fresh task ID for new processing
   - Handles partial failures and data corruption
 
+#### `DELETE /folders/{task_id}`
+**Delete all processing data for a folder (preserves original folder)**
+- **URL Parameters:**
+  - `task_id`: The task ID of the processed folder to delete
+- **Response:**
+```json
+{
+  "message": "Folder processing data deleted successfully",
+  "task_id": "uuid",
+  "deleted_records": {
+    "images": 150,
+    "folders": 1,
+    "s3_objects": 150
+  },
+  "preserved": {
+    "original_folder": "s3://rcsstoragebucket/djiimages/1/",
+    "original_contents": "All original images and files preserved"
+  }
+}
+```
+- **Features:**
+  - Removes all database entries (processed_folders and processed_images)
+  - Deletes S3 outputs folder and all processed images
+  - Preserves original folder and its contents
+  - Handles large S3 deletions in batches
+  - Safe operation - won't affect original data
+
 ### 📁 **Data Retrieval**
 
 #### `GET /folders`

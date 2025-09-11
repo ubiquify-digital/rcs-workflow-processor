@@ -1925,6 +1925,100 @@ async def generate_srt_for_folder(task_id: str, request: SrtGenerateRequest):
         raise HTTPException(status_code=500, detail=f"SRT generation error: {str(e)}")
 
 
+@app.delete("/folders/{task_id}")
+async def delete_folder_processing(task_id: str):
+    """
+    Delete all processing data for a folder:
+    - Removes database entries (processed_folders and processed_images)
+    - Deletes S3 outputs folder
+    - Preserves original folder and its contents
+    """
+    try:
+        # Get folder info first
+        folder_result = supabase.table('processed_folders').select('*').eq('task_id', task_id).execute()
+        if not folder_result.data:
+            raise HTTPException(status_code=404, detail=f"Folder with task_id {task_id} not found")
+        
+        folder_info = folder_result.data[0]
+        s3_input_folder_url = folder_info['s3_input_folder_url']
+        s3_output_folder_url = folder_info.get('s3_output_folder_url')
+        
+        logger.info(f"Deleting processing data for task_id: {task_id}")
+        logger.info(f"Input folder: {s3_input_folder_url}")
+        logger.info(f"Output folder: {s3_output_folder_url}")
+        
+        # Delete all processed images from database
+        images_result = supabase.table('processed_images').delete().eq('task_id', task_id).execute()
+        deleted_images_count = len(images_result.data) if images_result.data else 0
+        logger.info(f"Deleted {deleted_images_count} image records from database")
+        
+        # Delete folder record from database
+        folder_delete_result = supabase.table('processed_folders').delete().eq('task_id', task_id).execute()
+        deleted_folders_count = len(folder_delete_result.data) if folder_delete_result.data else 0
+        logger.info(f"Deleted {deleted_folders_count} folder record from database")
+        
+        # Delete S3 outputs folder if it exists
+        deleted_s3_objects = 0
+        if s3_output_folder_url:
+            try:
+                # Parse S3 output folder URL
+                s3_parts = s3_output_folder_url.replace('s3://', '').rstrip('/').split('/', 1)
+                bucket = s3_parts[0]
+                output_prefix = s3_parts[1] if len(s3_parts) > 1 else ''
+                
+                # List all objects in the output folder
+                s3_client = boto3.client('s3')
+                response = s3_client.list_objects_v2(
+                    Bucket=bucket,
+                    Prefix=output_prefix
+                )
+                
+                if 'Contents' in response:
+                    # Delete all objects in the output folder
+                    objects_to_delete = [{'Key': obj['Key']} for obj in response['Contents']]
+                    
+                    if objects_to_delete:
+                        # Delete in batches of 1000 (S3 limit)
+                        for i in range(0, len(objects_to_delete), 1000):
+                            batch = objects_to_delete[i:i+1000]
+                            delete_response = s3_client.delete_objects(
+                                Bucket=bucket,
+                                Delete={'Objects': batch}
+                            )
+                            deleted_s3_objects += len(batch)
+                            logger.info(f"Deleted batch of {len(batch)} objects from S3")
+                
+                logger.info(f"Deleted {deleted_s3_objects} objects from S3 output folder: {s3_output_folder_url}")
+                
+            except Exception as s3_error:
+                logger.warning(f"Error deleting S3 output folder: {str(s3_error)}")
+                # Don't fail the entire operation if S3 deletion fails
+        
+        # Remove from in-memory tasks if still present
+        if task_id in tasks:
+            del tasks[task_id]
+            logger.info(f"Removed task {task_id} from in-memory tasks")
+        
+        return {
+            "message": "Folder processing data deleted successfully",
+            "task_id": task_id,
+            "deleted_records": {
+                "images": deleted_images_count,
+                "folders": deleted_folders_count,
+                "s3_objects": deleted_s3_objects
+            },
+            "preserved": {
+                "original_folder": s3_input_folder_url,
+                "original_contents": "All original images and files preserved"
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting folder processing data: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error deleting folder processing data: {str(e)}")
+
 @app.get("/folders/{task_id}")
 async def get_folder_details(task_id: str):
     """Get detailed information about a specific processed folder"""
