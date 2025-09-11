@@ -168,7 +168,7 @@ def add_signed_urls_to_images(images: list) -> list:
     try:
         s3_client = boto3.client('s3')
         for image in images:
-            # Generate signed URL for input
+            # Generate signed URLs for input image and its variants
             if image.get('s3_input_url'):
                 s3_input_url = image['s3_input_url']
                 if s3_input_url.startswith('s3://'):
@@ -176,6 +176,11 @@ def add_signed_urls_to_images(images: list) -> list:
                     s3_parts = s3_input_url.replace('s3://', '').split('/', 1)
                     if len(s3_parts) == 2:
                         bucket, key = s3_parts
+                        key_parts = key.split('/')
+                        filename = key_parts[-1]
+                        base_name = os.path.splitext(filename)[0]
+                        
+                        # Generate signed URL for original input
                         try:
                             signed_input_url = s3_client.generate_presigned_url(
                                 'get_object',
@@ -186,14 +191,46 @@ def add_signed_urls_to_images(images: list) -> list:
                         except Exception as e:
                             logger.error(f"Error generating signed input URL for {s3_input_url}: {str(e)}")
                             image['signed_input_url'] = None
+                        
+                        # Generate signed URL for input thumbnail
+                        thumbnail_key = '/'.join(key_parts[:-1] + [f"thumbnails/{base_name}_thumbnail.jpg"])
+                        try:
+                            signed_input_thumbnail_url = s3_client.generate_presigned_url(
+                                'get_object',
+                                Params={'Bucket': bucket, 'Key': thumbnail_key},
+                                ExpiresIn=3600  # 1 hour
+                            )
+                            image['signed_input_thumbnail_url'] = signed_input_thumbnail_url
+                        except Exception as e:
+                            logger.error(f"Error generating signed input thumbnail URL for {thumbnail_key}: {str(e)}")
+                            image['signed_input_thumbnail_url'] = None
+                        
+                        # Generate signed URL for input lossless
+                        lossless_key = '/'.join(key_parts[:-1] + [f"lossless/{base_name}_lossless.jpg"])
+                        try:
+                            signed_input_lossless_url = s3_client.generate_presigned_url(
+                                'get_object',
+                                Params={'Bucket': bucket, 'Key': lossless_key},
+                                ExpiresIn=3600  # 1 hour
+                            )
+                            image['signed_input_lossless_url'] = signed_input_lossless_url
+                        except Exception as e:
+                            logger.error(f"Error generating signed input lossless URL for {lossless_key}: {str(e)}")
+                            image['signed_input_lossless_url'] = None
                     else:
                         image['signed_input_url'] = None
+                        image['signed_input_thumbnail_url'] = None
+                        image['signed_input_lossless_url'] = None
                 else:
                     image['signed_input_url'] = None
+                    image['signed_input_thumbnail_url'] = None
+                    image['signed_input_lossless_url'] = None
             else:
                 image['signed_input_url'] = None
+                image['signed_input_thumbnail_url'] = None
+                image['signed_input_lossless_url'] = None
                 
-            # Generate signed URL for output
+            # Generate signed URLs for output image and its variants
             if image.get('s3_output_url'):
                 s3_output_url = image['s3_output_url']
                 if s3_output_url.startswith('s3://'):
@@ -201,6 +238,11 @@ def add_signed_urls_to_images(images: list) -> list:
                     s3_parts = s3_output_url.replace('s3://', '').split('/', 1)
                     if len(s3_parts) == 2:
                         bucket, key = s3_parts
+                        key_parts = key.split('/')
+                        filename = key_parts[-1]
+                        base_name = os.path.splitext(filename)[0]
+                        
+                        # Generate signed URL for original output
                         try:
                             signed_output_url = s3_client.generate_presigned_url(
                                 'get_object',
@@ -211,12 +253,44 @@ def add_signed_urls_to_images(images: list) -> list:
                         except Exception as e:
                             logger.error(f"Error generating signed output URL for {s3_output_url}: {str(e)}")
                             image['signed_output_url'] = None
+                        
+                        # Generate signed URL for output thumbnail
+                        thumbnail_key = '/'.join(key_parts[:-1] + [f"thumbnails/{base_name}_thumbnail.jpg"])
+                        try:
+                            signed_output_thumbnail_url = s3_client.generate_presigned_url(
+                                'get_object',
+                                Params={'Bucket': bucket, 'Key': thumbnail_key},
+                                ExpiresIn=3600  # 1 hour
+                            )
+                            image['signed_output_thumbnail_url'] = signed_output_thumbnail_url
+                        except Exception as e:
+                            logger.error(f"Error generating signed output thumbnail URL for {thumbnail_key}: {str(e)}")
+                            image['signed_output_thumbnail_url'] = None
+                        
+                        # Generate signed URL for output lossless
+                        lossless_key = '/'.join(key_parts[:-1] + [f"lossless/{base_name}_lossless.jpg"])
+                        try:
+                            signed_output_lossless_url = s3_client.generate_presigned_url(
+                                'get_object',
+                                Params={'Bucket': bucket, 'Key': lossless_key},
+                                ExpiresIn=3600  # 1 hour
+                            )
+                            image['signed_output_lossless_url'] = signed_output_lossless_url
+                        except Exception as e:
+                            logger.error(f"Error generating signed output lossless URL for {lossless_key}: {str(e)}")
+                            image['signed_output_lossless_url'] = None
                     else:
                         image['signed_output_url'] = None
+                        image['signed_output_thumbnail_url'] = None
+                        image['signed_output_lossless_url'] = None
                 else:
                     image['signed_output_url'] = None
+                    image['signed_output_thumbnail_url'] = None
+                    image['signed_output_lossless_url'] = None
             else:
                 image['signed_output_url'] = None
+                image['signed_output_thumbnail_url'] = None
+                image['signed_output_lossless_url'] = None
                 
     except Exception as e:
         logger.error(f"Error adding signed URLs to images: {str(e)}")
@@ -224,6 +298,10 @@ def add_signed_urls_to_images(images: list) -> list:
         for image in images:
             image['signed_input_url'] = None
             image['signed_output_url'] = None
+            image['signed_input_thumbnail_url'] = None
+            image['signed_input_lossless_url'] = None
+            image['signed_output_thumbnail_url'] = None
+            image['signed_output_lossless_url'] = None
     
     return images
 
@@ -803,6 +881,105 @@ class ImageProcessor:
         else:
             return obj
     
+    def create_thumbnail(self, image_path: str, size: tuple = (300, 300)) -> str:
+        """Create a thumbnail of the image and return the local path"""
+        try:
+            with Image.open(image_path) as img:
+                # Convert to RGB if necessary (for JPEG compatibility)
+                if img.mode in ('RGBA', 'LA', 'P'):
+                    img = img.convert('RGB')
+                
+                # Create thumbnail maintaining aspect ratio
+                img.thumbnail(size, Image.Resampling.LANCZOS)
+                
+                # Create thumbnail filename
+                base_name = os.path.splitext(os.path.basename(image_path))[0]
+                thumbnail_path = os.path.join(self.temp_dir, f"{base_name}_thumbnail.jpg")
+                
+                # Save thumbnail
+                img.save(thumbnail_path, 'JPEG', quality=85, optimize=True)
+                
+                return thumbnail_path
+                
+        except Exception as e:
+            logger.error(f"Error creating thumbnail for {image_path}: {str(e)}")
+            raise
+    
+    def create_lossless_compressed(self, image_path: str) -> str:
+        """Create a lossless compressed version of the image and return the local path"""
+        try:
+            with Image.open(image_path) as img:
+                # Create compressed filename
+                base_name = os.path.splitext(os.path.basename(image_path))[0]
+                compressed_path = os.path.join(self.temp_dir, f"{base_name}_lossless.jpg")
+                
+                # Convert to RGB if necessary
+                if img.mode in ('RGBA', 'LA', 'P'):
+                    img = img.convert('RGB')
+                
+                # Save with high quality but optimized
+                img.save(compressed_path, 'JPEG', quality=95, optimize=True, progressive=True)
+                
+                return compressed_path
+                
+        except Exception as e:
+            logger.error(f"Error creating lossless compressed version for {image_path}: {str(e)}")
+            raise
+    
+    def upload_thumbnail_to_s3(self, local_thumbnail_path: str, filename: str) -> str:
+        """Upload thumbnail to S3 and return S3 URL"""
+        try:
+            s3_client = boto3.client('s3')
+            
+            # Parse output folder URL to get bucket and key prefix
+            # s3://bucket/folder/path/outputs/ -> bucket: "bucket", key_prefix: "folder/path/outputs/"
+            output_parts = self.s3_output_folder_url.replace('s3://', '').split('/', 1)
+            bucket = output_parts[0]
+            key_prefix = output_parts[1] if len(output_parts) > 1 else ''
+            
+            # Create S3 key for thumbnail
+            base_name = os.path.splitext(filename)[0]
+            s3_key = f"{key_prefix}thumbnails/{base_name}_thumbnail.jpg"
+            
+            # Upload thumbnail
+            s3_client.upload_file(local_thumbnail_path, bucket, s3_key)
+            
+            # Create S3 URL
+            s3_url = f"s3://{bucket}/{s3_key}"
+            
+            return s3_url
+            
+        except Exception as e:
+            logger.error(f"Error uploading thumbnail to S3: {str(e)}")
+            raise
+    
+    def upload_lossless_to_s3(self, local_lossless_path: str, filename: str) -> str:
+        """Upload lossless compressed image to S3 and return S3 URL"""
+        try:
+            s3_client = boto3.client('s3')
+            
+            # Parse output folder URL to get bucket and key prefix
+            # s3://bucket/folder/path/outputs/ -> bucket: "bucket", key_prefix: "folder/path/outputs/"
+            output_parts = self.s3_output_folder_url.replace('s3://', '').split('/', 1)
+            bucket = output_parts[0]
+            key_prefix = output_parts[1] if len(output_parts) > 1 else ''
+            
+            # Create S3 key for lossless image
+            base_name = os.path.splitext(filename)[0]
+            s3_key = f"{key_prefix}lossless/{base_name}_lossless.jpg"
+            
+            # Upload lossless image
+            s3_client.upload_file(local_lossless_path, bucket, s3_key)
+            
+            # Create S3 URL
+            s3_url = f"s3://{bucket}/{s3_key}"
+            
+            return s3_url
+            
+        except Exception as e:
+            logger.error(f"Error uploading lossless image to S3: {str(e)}")
+            raise
+
     def upload_output_image_to_s3(self, local_image_path: str, filename: str) -> str:
         """Upload processed image to S3 outputs folder and return S3 URL"""
         try:
@@ -975,6 +1152,34 @@ class ImageProcessor:
                     bucket_name = s3_parts[0]
                     folder_prefix = s3_parts[1] if len(s3_parts) > 1 else ''
                     correct_s3_input_url = f"s3://{bucket_name}/{folder_prefix}/{metadata['filename']}"
+                    
+                    # Create thumbnails and lossless compressed versions
+                    s3_input_url_thumbnail = None
+                    s3_input_url_lossless = None
+                    s3_output_url_thumbnail = None
+                    s3_output_url_lossless = None
+                    
+                    try:
+                        # Create thumbnail and lossless for input image
+                        input_thumbnail_path = self.create_thumbnail(image_path)
+                        input_lossless_path = self.create_lossless_compressed(image_path)
+                        
+                        # Upload input thumbnail and lossless to S3
+                        s3_input_url_thumbnail = self.upload_thumbnail_to_s3(input_thumbnail_path, metadata['filename'])
+                        s3_input_url_lossless = self.upload_lossless_to_s3(input_lossless_path, metadata['filename'])
+                        
+                        # Create thumbnail and lossless for output image if available
+                        if output_image_path and os.path.exists(output_image_path):
+                            output_thumbnail_path = self.create_thumbnail(output_image_path)
+                            output_lossless_path = self.create_lossless_compressed(output_image_path)
+                            
+                            # Upload output thumbnail and lossless to S3
+                            s3_output_url_thumbnail = self.upload_thumbnail_to_s3(output_thumbnail_path, f"processed_{metadata['filename']}")
+                            s3_output_url_lossless = self.upload_lossless_to_s3(output_lossless_path, f"processed_{metadata['filename']}")
+                            
+                    except Exception as thumb_error:
+                        logger.warning(f"Error creating thumbnails/lossless for {image_path}: {str(thumb_error)}")
+                        # Continue processing even if thumbnail/lossless creation fails
                     
                     # Store in database
                     image_data = {
