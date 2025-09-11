@@ -294,17 +294,17 @@ def analyze_detection_changes(image1: dict, image2: dict) -> tuple[List[Detectio
             ))
         
         # Pattern 2: Car initially → Car+Trash later (car brought/dumped trash)
-        elif cars1 > 0 and trash1 == 0 and cars2 > 0 and trash2 > 0:
-            dumping_detected = True
-            dumping_description = f"🚗🗑️ DUMPING DETECTED: Car dumped {trash2} trash item(s)"
-            changes.append(DetectionChange(
-                object_type="dumping_violation",
-                change_type="car_dumped_trash",
-                before_count=0,
-                after_count=trash2
-            ))
+        # elif cars1 > 0 and trash1 == 0 and cars2 > 0 and trash2 > 0:
+        #     dumping_detected = True
+        #     dumping_description = f"🚗🗑️ DUMPING DETECTED: Car dumped {trash2} trash item(s)"
+        #     changes.append(DetectionChange(
+        #         object_type="dumping_violation",
+        #         change_type="car_dumped_trash",
+        #         before_count=0,
+        #         after_count=trash2
+        #     ))
         
-        # # NOT NEEDED FOR NOW: Pattern 3: No objects initially → Car+Trash later (new dumping event)
+        # NOT NEEDED FOR NOW: Pattern 3: No objects initially → Car+Trash later (new dumping event)
         # elif cars1 == 0 and trash1 == 0 and cars2 > 0 and trash2 > 0:
         #     dumping_detected = True
         #     dumping_description = f"🚗🗑️ DUMPING DETECTED: Car arrived and dumped {trash2} trash item(s)"
@@ -316,16 +316,16 @@ def analyze_detection_changes(image1: dict, image2: dict) -> tuple[List[Detectio
         #     ))
         
         # Pattern 4: Car+Trash initially → More trash later (additional dumping)
-        elif cars1 > 0 and trash1 > 0 and trash2 > trash1:
-            dumping_detected = True
-            additional_trash = trash2 - trash1
-            dumping_description = f"🚗🗑️ DUMPING DETECTED: Additional {additional_trash} trash item(s) dumped"
-            changes.append(DetectionChange(
-                object_type="dumping_violation", 
-                change_type="additional_dumping",
-                before_count=trash1,
-                after_count=trash2
-            ))
+        # elif cars1 > 0 and trash1 > 0 and trash2 > trash1:
+        #     dumping_detected = True
+        #     additional_trash = trash2 - trash1
+        #     dumping_description = f"🚗🗑️ DUMPING DETECTED: Additional {additional_trash} trash item(s) dumped"
+        #     changes.append(DetectionChange(
+        #         object_type="dumping_violation", 
+        #         change_type="additional_dumping",
+        #         before_count=trash1,
+        #         after_count=trash2
+        #     ))
         
         # Generate summary - focus on dumping detection as primary use case
         if dumping_detected:
@@ -854,6 +854,26 @@ class ImageProcessor:
             logger.error(f"Error storing data in database: {str(e)}")
             raise
     
+    def generate_folder_name_from_timestamp(self, timestamp_str: str) -> str:
+        """Generate folder name from timestamp in format 'Run [Month] [Date] [time in 12 hour]'"""
+        try:
+            # Parse the ISO timestamp
+            dt = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+            
+            # Format: Run [Month] [Date] [time in 12 hour]
+            # Example: "Run January 15 2:30 PM"
+            month_name = dt.strftime('%B')  # Full month name
+            day = dt.strftime('%d').lstrip('0')  # Day without leading zero
+            time_12hr = dt.strftime('%I:%M %p').lstrip('0')  # 12-hour time without leading zero
+            
+            folder_name = f"Run {month_name} {day} {time_12hr}"
+            return folder_name
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Error parsing timestamp for folder name: {e}")
+            # Fallback to original naming if timestamp parsing fails
+            return f"Run {datetime.now().strftime('%B %d %I:%M %p')}"
+    
+    
     def create_folder_record(self, s3_folder_url: str, folder_name: str):
         """Create folder processing record in database"""
         try:
@@ -906,17 +926,29 @@ class ImageProcessor:
             # Create temporary directory
             self.temp_dir = tempfile.mkdtemp(prefix=f"image_process_{self.task_id}_")
             
-            # Extract folder name for database
-            folder_name = s3_folder_url.rstrip('/').split('/')[-1]
-            
-            # Create folder record in database
-            self.create_folder_record(s3_folder_url, folder_name)
-            
-            # Download images
+            # Download images first to get metadata for folder naming
             tasks[self.task_id]["progress"] = "Downloading images..."
             image_paths = self.download_images_from_s3_folder(s3_folder_url)
             tasks[self.task_id]["total_images"] = len(image_paths)
             self.total_count = len(image_paths)
+            
+            # Generate folder name from first image timestamp
+            folder_name = s3_folder_url.rstrip('/').split('/')[-1]  # Default fallback
+            if image_paths:
+                try:
+                    # Sort images by filename (assuming timestamp-based naming) and get first one
+                    sorted_paths = sorted(image_paths)
+                    first_image_metadata = self.extract_image_metadata(sorted_paths[0])
+                    if first_image_metadata.get('timestamp'):
+                        folder_name = self.generate_folder_name_from_timestamp(first_image_metadata['timestamp'])
+                        logger.info(f"Generated folder name: {folder_name}")
+                    else:
+                        logger.warning("No timestamp found in first image, using default folder name")
+                except Exception as e:
+                    logger.warning(f"Error generating folder name from first image: {e}")
+            
+            # Create folder record in database
+            self.create_folder_record(s3_folder_url, folder_name)
             
             # Process each image
             for i, image_path in enumerate(image_paths):
@@ -1005,6 +1037,181 @@ class ImageProcessor:
             # Cleanup
             if self.temp_dir and os.path.exists(self.temp_dir):
                 shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+def count_images_in_s3_folder(s3_folder_url: str) -> int:
+    """Count the number of image files in an S3 folder"""
+    try:
+        # Parse S3 URL to get bucket and prefix
+        s3_parts = s3_folder_url.replace('s3://', '').rstrip('/').split('/', 1)
+        bucket = s3_parts[0]
+        folder_prefix = s3_parts[1] if len(s3_parts) > 1 else ''
+        
+        # List all objects in the folder
+        s3_client = boto3.client('s3')
+        response = s3_client.list_objects_v2(
+            Bucket=bucket,
+            Prefix=folder_prefix
+        )
+        
+        if 'Contents' not in response:
+            return 0
+        
+        # Count image files
+        image_count = 0
+        for obj in response['Contents']:
+            key = obj['Key']
+            if key.lower().endswith(('.jpg', '.jpeg', '.png', '.tiff', '.tif')):
+                image_count += 1
+        
+        return image_count
+        
+    except Exception as e:
+        logger.warning(f"Error counting images in S3 folder {s3_folder_url}: {e}")
+        return 0
+
+def generate_folder_name_from_s3_folder(s3_folder_url: str) -> str:
+    """Generate folder name from first image in S3 folder for unprocessed folders"""
+    try:
+        # Parse S3 URL to get bucket and prefix
+        s3_parts = s3_folder_url.replace('s3://', '').rstrip('/').split('/', 1)
+        bucket = s3_parts[0]
+        folder_prefix = s3_parts[1] if len(s3_parts) > 1 else ''
+        
+        # List objects in the folder to find the first image
+        s3_client = boto3.client('s3')
+        response = s3_client.list_objects_v2(
+            Bucket=bucket,
+            Prefix=folder_prefix,
+            MaxKeys=10  # Get first few objects to find an image
+        )
+        
+        if 'Contents' not in response:
+            return s3_folder_url.rstrip('/').split('/')[-1]  # Fallback to original name
+        
+        # Find first image file
+        first_image_key = None
+        for obj in response['Contents']:
+            key = obj['Key']
+            if key.lower().endswith(('.jpg', '.jpeg', '.png', '.tiff', '.tif')):
+                first_image_key = key
+                break
+        
+        if not first_image_key:
+            return s3_folder_url.rstrip('/').split('/')[-1]  # Fallback to original name
+        
+        # Download first image temporarily to extract metadata
+        with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as temp_file:
+            s3_client.download_file(bucket, first_image_key, temp_file.name)
+            
+            # Extract metadata from the image
+            metadata = extract_image_metadata_standalone(temp_file.name)
+            
+            # Clean up temp file
+            os.unlink(temp_file.name)
+            
+            if metadata.get('timestamp'):
+                return generate_folder_name_from_timestamp_standalone(metadata['timestamp'])
+            else:
+                return s3_folder_url.rstrip('/').split('/')[-1]  # Fallback to original name
+                
+    except Exception as e:
+        logger.warning(f"Error generating folder name from S3 folder {s3_folder_url}: {e}")
+        return s3_folder_url.rstrip('/').split('/')[-1]  # Fallback to original name
+
+def generate_folder_name_from_timestamp_standalone(timestamp_str: str) -> str:
+    """Generate folder name from timestamp in format 'Run [Month] [Date] [time in 12 hour]'"""
+    try:
+        # Parse the ISO timestamp
+        dt = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+        
+        # Format: Run [Month] [Date] [time in 12 hour]
+        # Example: "Run January 15 2:30 PM"
+        month_name = dt.strftime('%B')  # Full month name
+        day = dt.strftime('%d').lstrip('0')  # Day without leading zero
+        time_12hr = dt.strftime('%I:%M %p').lstrip('0')  # 12-hour time without leading zero
+        
+        folder_name = f"Run {month_name} {day} {time_12hr}"
+        return folder_name
+    except (ValueError, TypeError) as e:
+        logger.warning(f"Error parsing timestamp for folder name: {e}")
+        # Fallback to original naming if timestamp parsing fails
+        return f"Run {datetime.now().strftime('%B %d %I:%M %p')}"
+
+def extract_image_metadata_standalone(image_path: str) -> Dict[str, Any]:
+    """Extract timestamp and GPS coordinates from image EXIF data (standalone version)"""
+    try:
+        with Image.open(image_path) as img:
+            exif_dict = img.getexif()
+            
+        metadata = {
+            'filename': os.path.basename(image_path),
+            'timestamp': None,
+            'latitude': None,
+            'longitude': None,
+            'altitude': None
+        }
+        
+        if not exif_dict:
+            logger.warning(f"No EXIF data found in {os.path.basename(image_path)}")
+            return metadata
+        
+        # Extract timestamp
+        for tag_id, value in exif_dict.items():
+            tag_name = TAGS.get(tag_id, tag_id)
+            if tag_name in ['DateTime', 'DateTimeOriginal', 'DateTimeDigitized']:
+                try:
+                    metadata['timestamp'] = datetime.strptime(value, '%Y:%m:%d %H:%M:%S').isoformat()
+                    break  # Use first valid timestamp found
+                except ValueError:
+                    continue
+        
+        # Extract GPS data
+        gps_ifd = exif_dict.get_ifd(0x8825)  # GPS IFD tag
+        if gps_ifd:
+            logger.info(f"Found GPS data in {os.path.basename(image_path)}")
+            
+            def convert_to_degrees(value):
+                """Convert GPS coordinates from degrees/minutes/seconds to decimal degrees"""
+                if isinstance(value, (tuple, list)) and len(value) == 3:
+                    d, m, s = value
+                    return float(d) + float(m)/60 + float(s)/3600
+                return 0.0
+            
+            # Extract GPS coordinates
+            gps_latitude = gps_ifd.get(2)  # GPSLatitude
+            gps_latitude_ref = gps_ifd.get(1)  # GPSLatitudeRef
+            gps_longitude = gps_ifd.get(4)  # GPSLongitude  
+            gps_longitude_ref = gps_ifd.get(3)  # GPSLongitudeRef
+            gps_altitude = gps_ifd.get(6)  # GPSAltitude
+            
+            if gps_latitude and gps_longitude:
+                lat = convert_to_degrees(gps_latitude)
+                lon = convert_to_degrees(gps_longitude)
+                
+                # Apply hemisphere corrections
+                if gps_latitude_ref and gps_latitude_ref.upper() == 'S':
+                    lat = -lat
+                if gps_longitude_ref and gps_longitude_ref.upper() == 'W':
+                    lon = -lon
+                    
+                metadata['latitude'] = lat
+                metadata['longitude'] = lon
+                logger.info(f"GPS coordinates for {os.path.basename(image_path)}: {lat:.6f}, {lon:.6f}")
+                
+                if gps_altitude:
+                    metadata['altitude'] = float(gps_altitude)
+        
+        return metadata
+        
+    except Exception as e:
+        logger.error(f"Error extracting metadata from {image_path}: {str(e)}")
+        return {
+            'filename': os.path.basename(image_path),
+            'timestamp': None,
+            'latitude': None,
+            'longitude': None,
+            'altitude': None
+        }
 
 # API Endpoints
 @app.post("/process-folder", response_model=ImageProcessResponse)
@@ -1447,7 +1654,7 @@ async def analyze_multifolder_dumping(request: MultifolderAnalysisRequest):
                                 if openai_data and len(openai_data) > 0:
                                     potential_plate = openai_data[0]  # First entry is usually license plate
                                     # Filter out OpenAI's "unable to read" responses and generic placeholders
-                                    if potential_plate and not any(phrase in potential_plate.lower() for phrase in ["unable to read", "can't read", "cannot read", "transcribe license", "license_plate", "license plate"]):
+                                    if potential_plate and not any(phrase in potential_plate.lower() for phrase in ["unable to read", "can't read", "cannot read", "transcribe license", "license_plate", "license plate", "UNREADABLE", "[UNREADABLE.]", "UNREADABLE", "UNREADABLE.", "unreadable", "unreadable.", "not readable", "cannot be read", "unclear", "blurry", "not visible", "no license plate"]):
                                         license_plate = potential_plate
                                 
                                 # Also check license plate model predictions
@@ -1469,13 +1676,13 @@ async def analyze_multifolder_dumping(request: MultifolderAnalysisRequest):
                             # Clean up license plate text (remove extra spaces, etc.)
                             license_plate = license_plate.strip()
                             if violation_type == "car_left_trash":
-                                updated_description = f"🚗🗑️ DUMPING DETECTED: Car [{license_plate}] left {trash_count} trash item(s) behind"
+                                updated_description = f"Car [{license_plate}] left {trash_count} trash item(s) behind"
                             elif violation_type == "car_dumped_trash":
-                                updated_description = f"🚗🗑️ DUMPING DETECTED: Car [{license_plate}] dumped {trash_count} trash item(s)"
+                                updated_description = f"Car [{license_plate}] dumped {trash_count} trash item(s)"
                             elif violation_type == "car_arrived_dumped":
-                                updated_description = f"🚗🗑️ DUMPING DETECTED: Car [{license_plate}] arrived and dumped {trash_count} trash item(s)"
+                                updated_description = f"Car [{license_plate}] arrived and dumped {trash_count} trash item(s)"
                             elif violation_type == "additional_dumping":
-                                updated_description = f"🚗🗑️ DUMPING DETECTED: Car [{license_plate}] dumped additional {trash_count} trash item(s)"
+                                updated_description = f"Car [{license_plate}] dumped additional {trash_count} trash item(s)"
                             else:
                                 updated_description = summary
                         else:
@@ -1514,12 +1721,12 @@ async def analyze_multifolder_dumping(request: MultifolderAnalysisRequest):
                         # NOTE: Commented out breaks to find ALL violations in each cluster
                         # Previously this would stop after finding first violation per cluster
                         # Break after finding first violation in this cluster to avoid duplicates
-                        # break
+                        break
                     
                 # NOTE: Commented out cluster-level break to find ALL violations
                 # Previously this would skip to next cluster after finding any violation
-                # if violations and violations[-1].cluster_id == cluster['id']:
-                #     break  # Found violation in this cluster, move to next cluster
+                if violations and violations[-1].cluster_id == cluster['id']:
+                    break  # Found violation in this cluster, move to next cluster
         
         # Sort violations by time difference (most recent first)
         violations.sort(key=lambda x: x.time_difference_minutes, reverse=True)
@@ -1703,7 +1910,7 @@ async def get_folder_summary(task_id: str):
         raise HTTPException(status_code=500, detail=f"Error fetching folder summary: {str(e)}")
 
 @app.get("/s3-folders")
-async def list_s3_folders(bucket: str = "rcsstoragebucket", prefix: str = "djiimages/"):
+async def list_s3_folders(bucket: str = "rcsstoragebucket", prefix: str = "fh_sync/bf03aad1-5c1a-464d-8bda-2eac7aeec67f/e1ab4550-4b97-4273-bee4-bccfe1eb87d9/media/"):
     """
     List available folders in S3 and their processing status
     """
@@ -1738,11 +1945,13 @@ async def list_s3_folders(bucket: str = "rcsstoragebucket", prefix: str = "djiim
                 s3_folders.append({
                     "folder_name": folder_name,
                     "s3_url": s3_url,
-                    "s3_path": folder_path
+                    "s3_path": folder_path,
+                    "total_images": 0,
+                    "processed_images": 0
                 })
         
         # Check processing status for each folder
-        processed_folders_result = supabase.table('processed_folders').select('s3_input_folder_url, status, task_id, total_images, processed_images').execute()
+        processed_folders_result = supabase.table('processed_folders').select('s3_input_folder_url, folder_name, status, task_id, total_images, processed_images').execute()
         processed_lookup = {folder['s3_input_folder_url']: folder for folder in processed_folders_result.data}
         
         # Combine S3 folder info with processing status
@@ -1751,15 +1960,27 @@ async def list_s3_folders(bucket: str = "rcsstoragebucket", prefix: str = "djiim
             s3_url = s3_folder['s3_url']
             processing_info = processed_lookup.get(s3_url)
             
+            # Use processed folder name if available, otherwise generate from first image
+            if processing_info:
+                display_folder_name = processing_info.get('folder_name')
+                total_images = processing_info.get('total_images')
+                processed_images = processing_info.get('processed_images')
+            else:
+                # Generate folder name from first image timestamp for unprocessed folders
+                display_folder_name = generate_folder_name_from_s3_folder(s3_url)
+                # Count images in S3 folder for unprocessed folders
+                total_images = count_images_in_s3_folder(s3_url)
+                processed_images = 0
+            
             folder_info = {
-                "folder_name": s3_folder['folder_name'],
+                "folder_name": display_folder_name,
                 "s3_url": s3_url,
                 "s3_path": s3_folder['s3_path'],
                 "is_processed": processing_info is not None,
                 "processing_status": processing_info.get('status') if processing_info else None,
                 "task_id": processing_info.get('task_id') if processing_info else None,
-                "total_images": processing_info.get('total_images') if processing_info else None,
-                "processed_images": processing_info.get('processed_images') if processing_info else None
+                "total_images": total_images,
+                "processed_images": processed_images
             }
             
             folders_with_status.append(folder_info)
