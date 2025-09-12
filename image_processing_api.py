@@ -803,6 +803,100 @@ class ImageProcessor:
         else:
             return obj
     
+    def add_logo_overlay(self, image_path: str) -> str:
+        """Add company logo overlay to image with 50% opacity in top right corner"""
+        try:
+            # Load the main image
+            main_image = Image.open(image_path)
+            
+            # Check if the image was saved by cv2 (BGR format) and convert to RGB
+            if main_image.mode == 'RGB':
+                # Convert BGR to RGB if the image was saved by cv2
+                import cv2
+                import numpy as np
+                
+                # Load with cv2 to get BGR format
+                cv2_image = cv2.imread(image_path)
+                if cv2_image is not None:
+                    # Convert BGR to RGB
+                    rgb_image = cv2.cvtColor(cv2_image, cv2.COLOR_BGR2RGB)
+                    # Convert numpy array to PIL Image
+                    main_image = Image.fromarray(rgb_image)
+                    logger.info(f"✅ Converted BGR image to RGB for logo overlay: {os.path.basename(image_path)}")
+            
+            # Load the company logo (favicon.png)
+            logo_path = os.path.join(os.path.dirname(__file__), 'favicon.png')
+            if not os.path.exists(logo_path):
+                logger.warning(f"Logo file not found at {logo_path}, skipping logo overlay")
+                return image_path
+            
+            logo = Image.open(logo_path)
+            
+            # Convert logo to RGBA if it isn't already
+            if logo.mode != 'RGBA':
+                logo = logo.convert('RGBA')
+            
+            # Store original mode for later conversion
+            original_mode = main_image.mode
+            
+            # Convert main image to RGBA for compositing
+            if main_image.mode != 'RGBA':
+                main_image = main_image.convert('RGBA')
+            
+            # Calculate logo size (10% of image width, maintaining aspect ratio)
+            logo_width = int(main_image.width * 0.1)
+            logo_height = int((logo.height * logo_width) / logo.width)
+            logo = logo.resize((logo_width, logo_height), Image.Resampling.LANCZOS)
+            
+            # Apply 50% opacity to logo
+            logo_with_alpha = Image.new('RGBA', logo.size, (0, 0, 0, 0))
+            for x in range(logo.width):
+                for y in range(logo.height):
+                    r, g, b, a = logo.getpixel((x, y))
+                    # Apply 50% opacity (multiply alpha by 0.5)
+                    new_alpha = int(a * 0.5)
+                    logo_with_alpha.putpixel((x, y), (r, g, b, new_alpha))
+            
+            # Calculate position for top right corner with some padding
+            padding = 20
+            x_position = main_image.width - logo_width - padding
+            y_position = padding
+            
+            # Create a copy of the main image to avoid modifying the original
+            output_image = main_image.copy()
+            
+            # Paste logo onto the main image
+            output_image.paste(logo_with_alpha, (x_position, y_position), logo_with_alpha)
+            
+            # Convert back to original mode before saving
+            if original_mode != 'RGBA':
+                output_image = output_image.convert(original_mode)
+            
+            # Save the image with logo overlay
+            # If the original image was saved by cv2, we need to convert back to BGR for cv2 compatibility
+            if original_mode == 'RGB':
+                # Convert RGB back to BGR for cv2 compatibility
+                import cv2
+                import numpy as np
+                
+                # Convert PIL to numpy array (RGB)
+                rgb_array = np.array(output_image)
+                # Convert RGB to BGR
+                bgr_array = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2BGR)
+                # Save with cv2 to maintain BGR format
+                cv2.imwrite(image_path, bgr_array)
+                logger.info(f"✅ Saved image with logo overlay in BGR format: {os.path.basename(image_path)}")
+            else:
+                # Save with PIL for other formats
+                output_image.save(image_path)
+            logger.info(f"✅ Added logo overlay to image: {os.path.basename(image_path)}")
+            
+            return image_path
+            
+        except Exception as e:
+            logger.error(f"Error adding logo overlay to {image_path}: {str(e)}")
+            return image_path  # Return original path if overlay fails
+    
     def upload_output_image_to_s3(self, local_image_path: str, filename: str) -> str:
         """Upload processed image to S3 outputs folder and return S3 URL"""
         try:
@@ -960,6 +1054,10 @@ class ImageProcessor:
                     
                     # Run through workflow
                     detections, output_image_path = self.process_image_with_workflow(image_path)
+                    
+                    # Add logo overlay to output image if available
+                    if output_image_path and os.path.exists(output_image_path):
+                        output_image_path = self.add_logo_overlay(output_image_path)
                     
                     # Upload output image to S3 if available
                     s3_output_url = None
@@ -1403,7 +1501,7 @@ async def get_processed_folders():
                 return datetime(1970, 1, 1)
         
         # Sort by timestamp (oldest first)
-        sorted_folders = sorted(result.data, key=get_folder_timestamp, reverse=False)
+        sorted_folders = sorted(result.data, key=get_folder_timestamp, reverse=True)
         
         return {"folders": sorted_folders}
     except Exception as e:
@@ -2245,7 +2343,7 @@ async def list_s3_folders(bucket: str = "rcsstoragebucket", prefix: str = "fh_sy
                 return datetime(1970, 1, 1)
         
         # Sort by timestamp (oldest first)
-        folders_with_status.sort(key=get_folder_timestamp, reverse=False)
+        folders_with_status.sort(key=get_folder_timestamp, reverse=True)
         
         return {
             "bucket": bucket,
