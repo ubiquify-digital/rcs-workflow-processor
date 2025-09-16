@@ -1944,8 +1944,14 @@ async def analyze_multifolder_dumping(request: MultifolderAnalysisRequest):
                             description=updated_description
                         )
                         
-                        violations.append(violation)
-                        analysis_summary[violation_type] += 1
+                        # Only count violation if license plate is detected
+                        if license_plate:
+                            violations.append(violation)
+                            analysis_summary[violation_type] += 1
+                        # Uncomment below to count violations even without license plate
+                        # else:
+                        #     violations.append(violation)
+                        #     analysis_summary[violation_type] += 1
                         
                         # NOTE: Commented out breaks to find ALL violations in each cluster
                         # Previously this would stop after finding first violation per cluster
