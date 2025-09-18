@@ -1,0 +1,33 @@
+[Unit]
+Description=QR Processing API - AI-powered QR code detection and decoding from drone imagery
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/workflows/qr_code_app
+Environment=PATH=/opt/conda/bin
+ExecStart=/opt/conda/bin/python qr_processing_api.py
+Restart=always
+RestartSec=3
+
+# Load environment variables from .env file
+EnvironmentFile=/home/ubuntu/workflows/.env
+
+# Security settings
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+# Resource limits
+LimitNOFILE=65536
+TimeoutStartSec=60
+TimeoutStopSec=30
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=qr-processing-api
+
+[Install]
+WantedBy=multi-user.target
