@@ -24,6 +24,11 @@ import requests
 import tempfile
 import uuid
 from datetime import datetime
+import qrcode
+from io import BytesIO
+import openai
+from collections import defaultdict
+import math
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -45,6 +50,15 @@ else:
     # Initialize Supabase client
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
     logger.info("Supabase client initialized successfully")
+
+# OpenAI configuration
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    logger.warning("OPENAI_API_KEY not found - AI VIN description features will be disabled")
+    openai_client = None
+else:
+    openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+    logger.info("OpenAI client initialized successfully")
 
 # Note: AWS credentials are handled automatically via environment or IAM role
 
@@ -74,7 +88,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "DELETE", "PUT", "PATCH"],
     allow_headers=["*"],
 )
 
@@ -109,6 +123,99 @@ class QRProcessResponse(BaseModel):
     processed_images: int
     results: List[ImageQRResult] = []
     error: Optional[str] = None
+
+# QR Generation Models
+class QRGenerateRequest(BaseModel):
+    vin: str
+    description: Optional[str] = None
+    size: int = 20  # Ultra-high resolution default for professional A4 printing
+
+class QRCodeRecord(BaseModel):
+    id: str
+    vin: str
+    description: Optional[str]
+    ai_description: Optional[str]
+    s3_url: str
+    image_url: str  # Signed URL
+    created_at: datetime
+    size: int
+
+class QRGenerateResponse(BaseModel):
+    success: bool
+    qr_code: QRCodeRecord
+    message: str
+
+class QRListResponse(BaseModel):
+    qr_codes: List[QRCodeRecord]
+    total: int
+
+# VIN Tracking Models
+class VINHistory(BaseModel):
+    vin: str
+    folder_name: str
+    folder_s3_url: str
+    image_filename: str
+    image_url: str
+    spotted_at: datetime
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    confidence: float
+
+class VINSummary(BaseModel):
+    vin: str
+    total_spottings: int
+    first_spotted: datetime
+    last_spotted: datetime
+    folders: List[str]
+    latest_location: Optional[Dict[str, float]] = None
+    ai_description: Optional[str] = None
+
+class VINListResponse(BaseModel):
+    vins: List[VINSummary]
+    total_vins: int
+
+class VINHistoryResponse(BaseModel):
+    vin: str
+    history: List[VINHistory]
+    total_spottings: int
+
+class MapPoint(BaseModel):
+    vin: str
+    latitude: float
+    longitude: float
+    image_url: str
+    spotted_at: datetime
+    confidence: float
+
+class MapData(BaseModel):
+    folder_name: str
+    folder_s3_url: str
+    total_images: int
+    total_vins: int
+    points: List[MapPoint]
+    bounds: Optional[Dict[str, float]] = None
+
+class VINDashboardResponse(BaseModel):
+    vins: List[VINSummary]
+    latest_map: Optional[MapData]
+    total_vins: int
+    total_folders: int
+
+class MovementPoint(BaseModel):
+    latitude: float
+    longitude: float
+    timestamp: datetime
+    confidence: float
+    folder_name: str
+    image_filename: str
+    image_url: str
+
+class VINMovementPath(BaseModel):
+    vin: str
+    total_points: int
+    movement_points: List[MovementPoint]
+    bounds: Optional[Dict[str, float]] = None
+    total_distance_meters: Optional[float] = None
 
 def list_images_in_s3_folder(s3_folder_url: str) -> List[str]:
     """List all image files in an S3 folder"""
@@ -327,6 +434,569 @@ def decode_qr_from_base64(base64_string: str) -> Optional[str]:
         logger.warning(f"Could not decode QR code: {str(e)}")
         return None
 
+# AI VIN Description Generation
+def generate_vin_description(vin: str) -> str:
+    """Generate AI-powered VIN description using ChatGPT"""
+    if not openai_client:
+        logger.warning("OpenAI client not available, skipping VIN description generation")
+        return None
+    
+    try:
+        prompt = f"""
+        Analyze this VIN number and provide detailed vehicle information in the following format:
+        VIN: {vin}
+        
+        Please provide ONLY the vehicle details in this exact format (no VIN prefix, no "Based on" text):
+        - Make: [Manufacturer]
+        - Model: [Model name]
+        - Year: [Year]
+        - Body: [Body style]
+        - Engine: [Engine specification]
+        - Assembly Plant: [Assembly location]
+        
+        If any information cannot be determined from the VIN, please indicate "Unknown" for that field.
+        Do not include the VIN number or "Based on" text in your response.
+        """
+        
+        response = openai_client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a vehicle information expert. Analyze VIN numbers and provide accurate vehicle details."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=300,
+            temperature=0.1
+        )
+        
+        description = response.choices[0].message.content.strip()
+        logger.info(f"Generated VIN description for {vin}")
+        return description
+        
+    except Exception as e:
+        logger.error(f"Error generating VIN description for {vin}: {e}")
+        return None
+
+# QR Generation Helper Functions
+def generate_qr_code(data: str, size: int = 10) -> bytes:
+    """Generate ultra-high-resolution QR code as PNG bytes for professional A4 printing"""
+    # For professional A4 printing at 300 DPI, we want the QR code to be 3-4 inches
+    # That's 900-1200 pixels, so with a typical QR code being ~25x25 modules
+    # We need box_size of 36-48 for ultra-high resolution A4 printing
+    
+    # Ultra-high resolution settings for professional printing
+    print_box_size = max(60, size * 5)  # Minimum 60 for ultra-high res, or 5x the requested size
+    
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_H,  # High error correction for maximum reliability
+        box_size=print_box_size,
+        border=4,  # Minimal border to maximize QR code size
+    )
+    qr.add_data(data)
+    qr.make(fit=True)
+    
+    img = qr.make_image(fill_color="black", back_color="white")
+    
+    # Convert to bytes with maximum quality settings
+    img_bytes = BytesIO()
+    img.save(img_bytes, format='PNG', optimize=False, compress_level=0, dpi=(300, 300))
+    img_bytes.seek(0)
+    
+    return img_bytes.getvalue()
+
+def create_s3_key_for_qr(vin: str) -> str:
+    """Create S3 key for QR code"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_vin = vin.replace("/", "_").replace("\\", "_")
+    return f"qr_codes/{safe_vin}_{timestamp}.png"
+
+def upload_qr_to_s3(file_bytes: bytes, s3_key: str) -> str:
+    """Upload QR code file to S3 and return the S3 URL"""
+    try:
+        s3_client = boto3.client('s3')
+        s3_client.put_object(
+            Bucket=os.getenv("S3_BUCKET", "rcsstoragebucket"),
+            Key=s3_key,
+            Body=file_bytes,
+            ContentType='image/png'
+        )
+        s3_url = f"s3://{os.getenv('S3_BUCKET', 'rcsstoragebucket')}/{s3_key}"
+        logger.info(f"Uploaded QR code to S3: {s3_url}")
+        return s3_url
+    except Exception as e:
+        logger.error(f"Error uploading QR to S3: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to upload QR to S3: {str(e)}")
+
+def store_qr_record(vin: str, description: Optional[str], ai_description: Optional[str], s3_url: str, size: int) -> str:
+    """Store QR code record in database"""
+    if not supabase:
+        logger.warning("Supabase not available, skipping database storage")
+        return str(uuid.uuid4())
+    
+    try:
+        record_id = str(uuid.uuid4())
+        record = {
+            "id": record_id,
+            "vin": vin,
+            "description": description,
+            "ai_description": ai_description,
+            "s3_url": s3_url,
+            "size": size,
+            "created_at": datetime.now().isoformat()
+        }
+        
+        result = supabase.table("qr_codes").insert(record).execute()
+        logger.info(f"Stored QR record in database: {record_id}")
+        return record_id
+    except Exception as e:
+        logger.error(f"Error storing QR record: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to store QR record: {str(e)}")
+
+def get_qr_records(limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
+    """Get QR code records from database"""
+    if not supabase:
+        logger.warning("Supabase not available, returning empty list")
+        return []
+    
+    try:
+        result = supabase.table("qr_codes").select("*").order("created_at", desc=True).range(offset, offset + limit - 1).execute()
+        return result.data
+    except Exception as e:
+        logger.error(f"Error fetching QR records: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch QR records: {str(e)}")
+
+# VIN Tracking Helper Functions
+def calculate_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Calculate distance between two GPS coordinates in meters using Haversine formula"""
+    R = 6371000  # Earth's radius in meters
+    
+    lat1_rad = math.radians(lat1)
+    lat2_rad = math.radians(lat2)
+    delta_lat = math.radians(lat2 - lat1)
+    delta_lon = math.radians(lon2 - lon1)
+    
+    a = (math.sin(delta_lat / 2) ** 2 + 
+         math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(delta_lon / 2) ** 2)
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    
+    return R * c
+
+def cluster_vin_sightings(vin_data: List[Dict[str, Any]], radius_meters: float = 10.0) -> List[Dict[str, Any]]:
+    """Cluster VIN sightings within a radius to count as single sightings"""
+    if not vin_data:
+        return []
+    
+    # Group by VIN
+    vin_groups = defaultdict(list)
+    for sighting in vin_data:
+        vin_groups[sighting["vin"]].append(sighting)
+    
+    clustered_data = []
+    
+    for vin, sightings in vin_groups.items():
+        if not sightings:
+            continue
+            
+        # Sort by timestamp
+        sightings.sort(key=lambda x: x["spotted_at"])
+        
+        # Cluster sightings within radius
+        clusters = []
+        for sighting in sightings:
+            if not sighting.get("latitude") or not sighting.get("longitude"):
+                # If no GPS data, treat as separate sighting
+                clusters.append([sighting])
+                continue
+                
+            # Check if this sighting belongs to an existing cluster
+            added_to_cluster = False
+            for cluster in clusters:
+                # Check distance to any sighting in the cluster
+                for cluster_sighting in cluster:
+                    if (cluster_sighting.get("latitude") and cluster_sighting.get("longitude")):
+                        distance = calculate_distance(
+                            sighting["latitude"], sighting["longitude"],
+                            cluster_sighting["latitude"], cluster_sighting["longitude"]
+                        )
+                        if distance <= radius_meters:
+                            cluster.append(sighting)
+                            added_to_cluster = True
+                            break
+                if added_to_cluster:
+                    break
+            
+            if not added_to_cluster:
+                clusters.append([sighting])
+        
+        # For each cluster, create a representative sighting
+        for cluster in clusters:
+            if not cluster:
+                continue
+                
+            # Use the first sighting as representative
+            representative = cluster[0].copy()
+            
+            # Update with cluster information
+            representative["cluster_size"] = len(cluster)
+            representative["total_confidence"] = sum(s.get("confidence", 0) for s in cluster)
+            representative["avg_confidence"] = representative["total_confidence"] / len(cluster)
+            
+            # Use the most recent timestamp from the cluster
+            representative["spotted_at"] = max(s["spotted_at"] for s in cluster)
+            
+            clustered_data.append(representative)
+    
+    return clustered_data
+
+def get_all_vins_from_processed_images() -> List[Dict[str, Any]]:
+    """Get all VINs extracted from processed images with their history"""
+    if not supabase:
+        logger.warning("Supabase not available, returning empty list")
+        return []
+    
+    try:
+        # Get all processed images with QR results
+        result = supabase.table("qr_processed_images").select(
+            "id, filename, s3_input_url, image_signed_url, timestamp, latitude, longitude, qr_results, task_id"
+        ).eq("processing_status", "success").execute()
+        
+        # Get folder information
+        folder_result = supabase.table("qr_processed_folders").select("task_id, folder_name, s3_input_folder_url").execute()
+        folder_map = {folder["task_id"]: folder for folder in folder_result.data}
+        
+        # Extract VINs from QR results
+        vin_data = []
+        for image in result.data:
+            if image.get("qr_results"):
+                folder_info = folder_map.get(image["task_id"], {})
+                
+                # Generate fresh signed URL for each image
+                fresh_image_url = get_s3_signed_url(image["s3_input_url"])
+                
+                for qr in image["qr_results"]:
+                    content = qr.get("content", "")
+                    # Accept VINs (17 chars) and other vehicle identifiers (8-20 chars, alphanumeric)
+                    if content and 8 <= len(content) <= 20 and content.replace("-", "").replace("_", "").isalnum():
+                        vin_data.append({
+                            "vin": qr["content"],
+                            "confidence": qr.get("confidence", 0.0),
+                            "image_filename": image["filename"],
+                            "image_url": fresh_image_url,
+                            "spotted_at": image["timestamp"],
+                            "latitude": image.get("latitude"),
+                            "longitude": image.get("longitude"),
+                            "folder_name": folder_info.get("folder_name", "Unknown"),
+                            "folder_s3_url": folder_info.get("s3_input_folder_url", ""),
+                            "task_id": image["task_id"]
+                        })
+        
+        return vin_data
+    except Exception as e:
+        logger.error(f"Error fetching VIN data: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch VIN data: {str(e)}")
+
+def get_vin_summary(vin: str) -> VINSummary:
+    """Get summary information for a specific VIN"""
+    vin_data = get_all_vins_from_processed_images()
+    vin_occurrences = [v for v in vin_data if v["vin"] == vin]
+    
+    if not vin_occurrences:
+        raise HTTPException(status_code=404, detail=f"VIN {vin} not found")
+    
+    # Sort by timestamp
+    vin_occurrences.sort(key=lambda x: x["spotted_at"])
+    
+    # Get unique folders
+    folders = list(set([v["folder_name"] for v in vin_occurrences]))
+    
+    # Get latest location
+    latest_location = None
+    latest_occurrence = vin_occurrences[-1]
+    if latest_occurrence.get("latitude") and latest_occurrence.get("longitude"):
+        latest_location = {
+            "latitude": latest_occurrence["latitude"],
+            "longitude": latest_occurrence["longitude"]
+        }
+    
+    # Get AI description from qr_codes table
+    ai_description = None
+    try:
+        if supabase:
+            qr_result = supabase.table("qr_codes").select("ai_description").eq("vin", vin).execute()
+            if qr_result.data:
+                ai_description = qr_result.data[0].get("ai_description")
+    except Exception as e:
+        logger.warning(f"Could not fetch AI description for VIN {vin}: {e}")
+    
+    return VINSummary(
+        vin=vin,
+        total_spottings=len(vin_occurrences),
+        first_spotted=datetime.fromisoformat(vin_occurrences[0]["spotted_at"].replace('Z', '+00:00')),
+        last_spotted=datetime.fromisoformat(vin_occurrences[-1]["spotted_at"].replace('Z', '+00:00')),
+        folders=folders,
+        latest_location=latest_location,
+        ai_description=ai_description
+    )
+
+def get_latest_folder_map() -> Optional[MapData]:
+    """Get map data for the latest processed folder"""
+    if not supabase:
+        return None
+    
+    try:
+        # Get all completed folders and sort by folder name (which contains timestamp)
+        folder_result = supabase.table("qr_processed_folders").select(
+            "task_id, folder_name, s3_input_folder_url, total_images, created_at"
+        ).eq("status", "completed").execute()
+        
+        if not folder_result.data:
+            return None
+        
+        # Sort by folder name to get the most recent drone run chronologically
+        # Folder names like "Run September 22 6:07 PM" sort correctly as strings
+        folders = sorted(folder_result.data, key=lambda x: x["folder_name"], reverse=True)
+        latest_folder = folders[0]
+        
+        # Get all images from this folder with VINs
+        images_result = supabase.table("qr_processed_images").select(
+            "filename, s3_input_url, image_signed_url, timestamp, latitude, longitude, qr_results"
+        ).eq("task_id", latest_folder["task_id"]).eq("processing_status", "success").execute()
+        
+        # Collect all VIN points first
+        all_points = []
+        for image in images_result.data:
+            if image.get("qr_results") and image.get("latitude") and image.get("longitude"):
+                # Generate fresh signed URL for each image
+                fresh_image_url = get_s3_signed_url(image["s3_input_url"])
+                
+                for qr in image["qr_results"]:
+                    content = qr.get("content", "")
+                    # Accept VINs (17 chars) and other vehicle identifiers (8-20 chars, alphanumeric)
+                    if content and 8 <= len(content) <= 20 and content.replace("-", "").replace("_", "").isalnum():
+                        all_points.append({
+                            "vin": qr["content"],
+                            "latitude": float(image["latitude"]),
+                            "longitude": float(image["longitude"]),
+                            "image_url": fresh_image_url,
+                            "spotted_at": datetime.fromisoformat(image["timestamp"].replace('Z', '+00:00')),
+                            "confidence": qr.get("confidence", 0.0)
+                        })
+        
+        # Apply clustering to group nearby VINs within this folder only
+        clustered_points = cluster_vin_sightings(all_points, radius_meters=10.0)
+        
+        # Convert to MapPoint objects
+        points = []
+        for point in clustered_points:
+            points.append(MapPoint(
+                vin=point["vin"],
+                latitude=point["latitude"],
+                longitude=point["longitude"],
+                image_url=point["image_url"],
+                spotted_at=point["spotted_at"],
+                confidence=point.get("avg_confidence", point.get("confidence", 0.0))
+            ))
+        
+        # Calculate bounds
+        bounds = None
+        if points:
+            lats = [p.latitude for p in points]
+            lons = [p.longitude for p in points]
+            bounds = {
+                "north": max(lats),
+                "south": min(lats),
+                "east": max(lons),
+                "west": min(lons)
+            }
+        
+        return MapData(
+            folder_name=latest_folder["folder_name"],
+            folder_s3_url=latest_folder["s3_input_folder_url"],
+            total_images=latest_folder["total_images"],
+            total_vins=len(set(p.vin for p in points)),
+            points=points,
+            bounds=bounds
+        )
+    except Exception as e:
+        logger.error(f"Error fetching latest folder map: {e}")
+        return None
+
+def get_vin_movement_path(vin: str) -> VINMovementPath:
+    """Get movement path for a specific VIN across all folders"""
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Database not available")
+    
+    try:
+        # Get all processed images with QR results
+        result = supabase.table("qr_processed_images").select(
+            "id, filename, s3_input_url, image_signed_url, timestamp, latitude, longitude, qr_results, task_id"
+        ).eq("processing_status", "success").execute()
+        
+        # Get folder information
+        folder_result = supabase.table("qr_processed_folders").select("task_id, folder_name").execute()
+        folder_map = {folder["task_id"]: folder for folder in folder_result.data}
+        
+        # Extract movement points for this VIN
+        movement_points = []
+        for image in result.data:
+            if image.get("qr_results") and image.get("latitude") and image.get("longitude"):
+                folder_info = folder_map.get(image["task_id"], {})
+                
+                # Generate fresh signed URL for each image
+                fresh_image_url = get_s3_signed_url(image["s3_input_url"])
+                
+                for qr in image["qr_results"]:
+                    content = qr.get("content", "")
+                    if content == vin:  # Match exact VIN
+                        movement_points.append(MovementPoint(
+                            latitude=float(image["latitude"]),
+                            longitude=float(image["longitude"]),
+                            timestamp=datetime.fromisoformat(image["timestamp"].replace('Z', '+00:00')),
+                            confidence=qr.get("confidence", 0.0),
+                            folder_name=folder_info.get("folder_name", "Unknown"),
+                            image_filename=image["filename"],
+                            image_url=fresh_image_url
+                        ))
+        
+        # Sort by folder chronological order (drone flight sequence)
+        # Extract time from folder name for proper chronological ordering
+        def get_folder_timestamp(folder_name):
+            try:
+                # Parse "Run September 22 6:07 PM" format
+                parts = folder_name.split()
+                if len(parts) >= 4:
+                    month = parts[1]
+                    day = parts[2]
+                    time_str = parts[3] + " " + parts[4]  # "6:07 PM"
+                    
+                    # Convert to sortable format
+                    from datetime import datetime
+                    # This is a simplified approach - in production you'd want more robust parsing
+                    return folder_name  # For now, use string sorting which works for this format
+                return folder_name
+            except:
+                return folder_name
+        
+        # Sort by folder name (which contains chronological timestamp)
+        movement_points.sort(key=lambda x: get_folder_timestamp(x.folder_name))
+        
+        # Apply clustering within each folder (not across folders)
+        clustered_movement_points = []
+        current_folder = None
+        current_folder_points = []
+        
+        for point in movement_points:
+            if current_folder != point.folder_name:
+                # Process previous folder's points
+                if current_folder_points:
+                    clustered_points = cluster_vin_sightings([
+                        {
+                            "vin": vin,
+                            "latitude": p.latitude,
+                            "longitude": p.longitude,
+                            "spotted_at": p.timestamp.isoformat(),
+                            "confidence": p.confidence,
+                            "folder_name": p.folder_name,
+                            "image_filename": p.image_filename,
+                            "image_url": p.image_url
+                        } for p in current_folder_points
+                    ], radius_meters=15.0)
+                    
+                    # Convert back to MovementPoint objects
+                    for clustered_point in clustered_points:
+                        clustered_movement_points.append(MovementPoint(
+                            latitude=clustered_point["latitude"],
+                            longitude=clustered_point["longitude"],
+                            timestamp=datetime.fromisoformat(clustered_point["spotted_at"].replace('Z', '+00:00')),
+                            confidence=clustered_point.get("avg_confidence", clustered_point.get("confidence", 0.0)),
+                            folder_name=clustered_point["folder_name"],
+                            image_filename=clustered_point["image_filename"],
+                            image_url=clustered_point["image_url"]
+                        ))
+                
+                # Start new folder
+                current_folder = point.folder_name
+                current_folder_points = [point]
+            else:
+                current_folder_points.append(point)
+        
+        # Process the last folder
+        if current_folder_points:
+            clustered_points = cluster_vin_sightings([
+                {
+                    "vin": vin,
+                    "latitude": p.latitude,
+                    "longitude": p.longitude,
+                    "spotted_at": p.timestamp.isoformat(),
+                    "confidence": p.confidence,
+                    "folder_name": p.folder_name,
+                    "image_filename": p.image_filename,
+                    "image_url": p.image_url
+                } for p in current_folder_points
+            ], radius_meters=15.0)
+            
+            # Convert back to MovementPoint objects
+            for clustered_point in clustered_points:
+                clustered_movement_points.append(MovementPoint(
+                    latitude=clustered_point["latitude"],
+                    longitude=clustered_point["longitude"],
+                    timestamp=datetime.fromisoformat(clustered_point["spotted_at"].replace('Z', '+00:00')),
+                    confidence=clustered_point.get("avg_confidence", clustered_point.get("confidence", 0.0)),
+                    folder_name=clustered_point["folder_name"],
+                    image_filename=clustered_point["image_filename"],
+                    image_url=clustered_point["image_url"]
+                ))
+        
+        movement_points = clustered_movement_points
+        
+        # Calculate bounds
+        bounds = None
+        if movement_points:
+            lats = [p.latitude for p in movement_points]
+            lons = [p.longitude for p in movement_points]
+            bounds = {
+                "north": max(lats),
+                "south": min(lats),
+                "east": max(lons),
+                "west": min(lons)
+            }
+        
+        # Calculate total distance
+        total_distance = 0.0
+        if len(movement_points) > 1:
+            for i in range(1, len(movement_points)):
+                prev_point = movement_points[i-1]
+                curr_point = movement_points[i]
+                distance = calculate_distance(
+                    prev_point.latitude, prev_point.longitude,
+                    curr_point.latitude, curr_point.longitude
+                )
+                total_distance += distance
+        
+        return VINMovementPath(
+            vin=vin,
+            total_points=len(movement_points),
+            movement_points=movement_points,
+            bounds=bounds,
+            total_distance_meters=total_distance if total_distance > 0 else None
+        )
+        
+    except Exception as e:
+        logger.error(f"Error fetching movement path for VIN {vin}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch movement path: {str(e)}")
+
+def get_qr_record_by_id(record_id: str) -> Optional[Dict[str, Any]]:
+    """Get specific QR code record by ID"""
+    if not supabase:
+        return None
+    
+    try:
+        result = supabase.table("qr_codes").select("*").eq("id", record_id).execute()
+        return result.data[0] if result.data else None
+    except Exception as e:
+        logger.error(f"Error fetching QR record {record_id}: {e}")
+        return None
+
 @app.get("/")
 async def root():
     return {
@@ -430,7 +1100,7 @@ def generate_folder_name_from_s3_folder(s3_folder_url: str) -> str:
         return s3_folder_url.rstrip('/').split('/')[-1]  # Fallback to original name
 
 @app.get("/s3-folders")
-async def list_s3_folders(bucket: str = "rcsstoragebucket", prefix: str = "fh_sync/bf03aad1-5c1a-464d-8bda-2eac7aeec67f/e1ab4550-4b97-4273-bee4-bccfe1eb87d9/media/"):
+async def list_s3_folders(bucket: str = "rcsstoragebucket", prefix: str = "qr_sync/"):
     """
     List available folders in S3 for QR code processing
     """
@@ -945,6 +1615,326 @@ async def reprocess_folder(request: QRProcessRequest):
     except Exception as e:
         logger.error(f"Error reprocessing folder: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error reprocessing folder: {str(e)}")
+
+# QR Generation Endpoints
+@app.post("/generate-qr", response_model=QRGenerateResponse)
+async def generate_qr(request: QRGenerateRequest):
+    """Generate QR code for VIN number with AI description"""
+    try:
+        logger.info(f"Generating QR code for VIN: {request.vin}")
+        
+        # Generate AI description
+        ai_description = generate_vin_description(request.vin)
+        
+        # Generate QR code
+        qr_bytes = generate_qr_code(request.vin, request.size)
+        
+        # Create S3 key
+        s3_key = create_s3_key_for_qr(request.vin)
+        
+        # Upload to S3
+        s3_url = upload_qr_to_s3(qr_bytes, s3_key)
+        
+        # Generate signed URL
+        image_url = get_s3_signed_url(s3_url)
+        
+        # Store in database
+        record_id = store_qr_record(request.vin, request.description, ai_description, s3_url, request.size)
+        
+        # Create response
+        qr_record = QRCodeRecord(
+            id=record_id,
+            vin=request.vin,
+            description=request.description,
+            ai_description=ai_description,
+            s3_url=s3_url,
+            image_url=image_url,
+            created_at=datetime.now(),
+            size=request.size
+        )
+        
+        return QRGenerateResponse(
+            success=True,
+            qr_code=qr_record,
+            message=f"QR code generated successfully for VIN: {request.vin}"
+        )
+        
+    except Exception as e:
+        logger.error(f"Error generating QR code: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate QR code: {str(e)}")
+
+@app.get("/qr-codes", response_model=QRListResponse)
+async def list_qr_codes(
+    limit: int = 100,
+    offset: int = 0
+):
+    """List all QR codes with signed URLs"""
+    try:
+        logger.info(f"Fetching QR codes: limit={limit}, offset={offset}")
+        
+        # Get records from database
+        records = get_qr_records(limit, offset)
+        
+        # Convert to response format with fresh signed URLs
+        qr_codes = []
+        for record in records:
+            # Generate fresh signed URL
+            try:
+                image_url = get_s3_signed_url(record["s3_url"])
+            except Exception as e:
+                logger.warning(f"Failed to generate signed URL for {record['id']}: {e}")
+                image_url = "URL_EXPIRED"
+            
+            qr_code = QRCodeRecord(
+                id=record["id"],
+                vin=record["vin"],
+                description=record.get("description"),
+                ai_description=record.get("ai_description"),
+                s3_url=record["s3_url"],
+                image_url=image_url,
+                created_at=datetime.fromisoformat(record["created_at"].replace('Z', '+00:00')),
+                size=record["size"]
+            )
+            qr_codes.append(qr_code)
+        
+        return QRListResponse(
+            qr_codes=qr_codes,
+            total=len(qr_codes)
+        )
+        
+    except Exception as e:
+        logger.error(f"Error listing QR codes: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to list QR codes: {str(e)}")
+
+@app.get("/qr-codes/{qr_id}")
+async def get_qr_code(qr_id: str):
+    """Get specific QR code by ID"""
+    try:
+        record = get_qr_record_by_id(qr_id)
+        if not record:
+            raise HTTPException(status_code=404, detail="QR code not found")
+        
+        # Generate fresh signed URL
+        image_url = get_s3_signed_url(record["s3_url"])
+        
+        return QRCodeRecord(
+            id=record["id"],
+            vin=record["vin"],
+            description=record.get("description"),
+            ai_description=record.get("ai_description"),
+            s3_url=record["s3_url"],
+            image_url=image_url,
+            created_at=datetime.fromisoformat(record["created_at"].replace('Z', '+00:00')),
+            size=record["size"]
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching QR code {qr_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch QR code: {str(e)}")
+
+@app.delete("/qr-codes/{qr_id}")
+async def delete_qr_code(qr_id: str):
+    """Delete QR code and its S3 object"""
+    try:
+        # Get record from database
+        record = get_qr_record_by_id(qr_id)
+        if not record:
+            raise HTTPException(status_code=404, detail="QR code not found")
+        
+        # Delete from S3
+        s3_key = record["s3_url"].replace(f"s3://{os.getenv('S3_BUCKET', 'rcsstoragebucket')}/", "")
+        try:
+            s3_client = boto3.client('s3')
+            s3_client.delete_object(Bucket=os.getenv("S3_BUCKET", "rcsstoragebucket"), Key=s3_key)
+            logger.info(f"Deleted S3 object: {s3_key}")
+        except Exception as e:
+            logger.warning(f"Failed to delete S3 object {s3_key}: {e}")
+        
+        # Delete from database
+        if supabase:
+            try:
+                supabase.table("qr_codes").delete().eq("id", qr_id).execute()
+                logger.info(f"Deleted QR record from database: {qr_id}")
+            except Exception as e:
+                logger.warning(f"Failed to delete database record {qr_id}: {e}")
+        
+        return {"success": True, "message": f"QR code {qr_id} deleted successfully"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting QR code {qr_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete QR code: {str(e)}")
+
+# VIN Tracking Endpoints
+@app.get("/vins", response_model=VINListResponse)
+async def list_all_vins():
+    """Get all unique VINs with summary information"""
+    try:
+        vin_data = get_all_vins_from_processed_images()
+        
+        # Group by VIN
+        vin_groups = defaultdict(list)
+        for vin_record in vin_data:
+            vin_groups[vin_record["vin"]].append(vin_record)
+        
+        # Create VIN summaries
+        vins = []
+        for vin, occurrences in vin_groups.items():
+            # Sort by timestamp
+            occurrences.sort(key=lambda x: x["spotted_at"])
+            
+            # Get unique folders
+            folders = list(set([v["folder_name"] for v in occurrences]))
+            
+            # Get latest location
+            latest_location = None
+            latest_occurrence = occurrences[-1]
+            if latest_occurrence.get("latitude") and latest_occurrence.get("longitude"):
+                latest_location = {
+                    "latitude": latest_occurrence["latitude"],
+                    "longitude": latest_occurrence["longitude"]
+                }
+            
+            # Get AI description
+            ai_description = None
+            try:
+                if supabase:
+                    qr_result = supabase.table("qr_codes").select("ai_description").eq("vin", vin).execute()
+                    if qr_result.data:
+                        ai_description = qr_result.data[0].get("ai_description")
+            except Exception as e:
+                logger.warning(f"Could not fetch AI description for VIN {vin}: {e}")
+            
+            vins.append(VINSummary(
+                vin=vin,
+                total_spottings=len(occurrences),
+                first_spotted=datetime.fromisoformat(occurrences[0]["spotted_at"].replace('Z', '+00:00')),
+                last_spotted=datetime.fromisoformat(occurrences[-1]["spotted_at"].replace('Z', '+00:00')),
+                folders=folders,
+                latest_location=latest_location,
+                ai_description=ai_description
+            ))
+        
+        # Sort by last spotted (most recent first)
+        vins.sort(key=lambda x: x.last_spotted, reverse=True)
+        
+        return VINListResponse(
+            vins=vins,
+            total_vins=len(vins)
+        )
+        
+    except Exception as e:
+        logger.error(f"Error listing VINs: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to list VINs: {str(e)}")
+
+@app.get("/vins/{vin}/history", response_model=VINHistoryResponse)
+async def get_vin_history(vin: str):
+    """Get detailed history for a specific VIN"""
+    try:
+        vin_data = get_all_vins_from_processed_images()
+        vin_occurrences = [v for v in vin_data if v["vin"] == vin]
+        
+        if not vin_occurrences:
+            raise HTTPException(status_code=404, detail=f"VIN {vin} not found")
+        
+        # Sort by timestamp
+        vin_occurrences.sort(key=lambda x: x["spotted_at"])
+        
+        # Convert to VINHistory objects
+        history = []
+        for occurrence in vin_occurrences:
+            history.append(VINHistory(
+                vin=occurrence["vin"],
+                folder_name=occurrence["folder_name"],
+                folder_s3_url=occurrence["folder_s3_url"],
+                image_filename=occurrence["image_filename"],
+                image_url=occurrence["image_url"],
+                spotted_at=datetime.fromisoformat(occurrence["spotted_at"].replace('Z', '+00:00')),
+                latitude=occurrence.get("latitude"),
+                longitude=occurrence.get("longitude"),
+                confidence=occurrence["confidence"]
+            ))
+        
+        return VINHistoryResponse(
+            vin=vin,
+            history=history,
+            total_spottings=len(history)
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching VIN history for {vin}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch VIN history: {str(e)}")
+
+@app.get("/vins/{vin}", response_model=VINSummary)
+async def get_vin_summary_endpoint(vin: str):
+    """Get summary information for a specific VIN"""
+    try:
+        return get_vin_summary(vin)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching VIN summary for {vin}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch VIN summary: {str(e)}")
+
+@app.get("/map/latest", response_model=MapData)
+async def get_latest_folder_map_endpoint():
+    """Get map data for the latest processed folder"""
+    try:
+        map_data = get_latest_folder_map()
+        if not map_data:
+            raise HTTPException(status_code=404, detail="No completed folders found")
+        return map_data
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching latest folder map: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch latest folder map: {str(e)}")
+
+@app.get("/dashboard", response_model=VINDashboardResponse)
+async def get_vin_dashboard():
+    """Get comprehensive VIN dashboard with all VINs and latest map"""
+    try:
+        # Get all VINs
+        vin_response = await list_all_vins()
+        
+        # Get latest map
+        latest_map = get_latest_folder_map()
+        
+        # Get total folders count
+        total_folders = 0
+        if supabase:
+            try:
+                folder_result = supabase.table("qr_processed_folders").select("id", count="exact").execute()
+                total_folders = folder_result.count or 0
+            except Exception as e:
+                logger.warning(f"Could not fetch total folders count: {e}")
+        
+        return VINDashboardResponse(
+            vins=vin_response.vins,
+            latest_map=latest_map,
+            total_vins=vin_response.total_vins,
+            total_folders=total_folders
+        )
+        
+    except Exception as e:
+        logger.error(f"Error fetching VIN dashboard: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch VIN dashboard: {str(e)}")
+
+@app.get("/vins/{vin}/movement", response_model=VINMovementPath)
+async def get_vin_movement_path_endpoint(vin: str):
+    """Get movement path for a specific VIN showing GPS trail over time"""
+    try:
+        return get_vin_movement_path(vin)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching movement path for {vin}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch movement path: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn

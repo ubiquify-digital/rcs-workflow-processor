@@ -1,4 +1,4 @@
--- QR Code Generator Database Schema
+-- QR Codes Database Schema
 -- This schema stores generated QR codes for VIN numbers
 
 -- Create qr_codes table
@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS qr_codes (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     vin VARCHAR(17) NOT NULL,
     description TEXT,
+    ai_description TEXT,
     s3_url TEXT NOT NULL,
     size INTEGER NOT NULL DEFAULT 10,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
