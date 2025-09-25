@@ -648,8 +648,12 @@ def cluster_vin_sightings(vin_data: List[Dict[str, Any]], radius_meters: float =
     
     return clustered_data
 
-def get_all_vins_from_processed_images() -> List[Dict[str, Any]]:
-    """Get all VINs extracted from processed images with their history"""
+def get_all_vins_from_processed_images(folder_filter: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """Get all VINs extracted from processed images with their history
+    
+    Args:
+        folder_filter: Optional list of folder names to filter by
+    """
     if not supabase:
         logger.warning("Supabase not available, returning empty list")
         return []
@@ -660,7 +664,7 @@ def get_all_vins_from_processed_images() -> List[Dict[str, Any]]:
             "id, filename, s3_input_url, image_signed_url, timestamp, latitude, longitude, qr_results, task_id"
         ).eq("processing_status", "success").execute()
         
-        # Get folder information
+        # Get folder information (always get all folders for proper mapping)
         folder_result = supabase.table("qr_processed_folders").select("task_id, folder_name, s3_input_folder_url").execute()
         folder_map = {folder["task_id"]: folder for folder in folder_result.data}
         
@@ -689,6 +693,10 @@ def get_all_vins_from_processed_images() -> List[Dict[str, Any]]:
                             "folder_s3_url": folder_info.get("s3_input_folder_url", ""),
                             "task_id": image["task_id"]
                         })
+        
+        # Apply folder filtering if specified
+        if folder_filter:
+            vin_data = [v for v in vin_data if v["folder_name"] in folder_filter]
         
         return vin_data
     except Exception as e:
@@ -738,16 +746,25 @@ def get_vin_summary(vin: str) -> VINSummary:
         ai_description=ai_description
     )
 
-def get_latest_folder_map() -> Optional[MapData]:
-    """Get map data for the latest processed folder"""
+def get_latest_folder_map(folder_filter: Optional[List[str]] = None) -> Optional[MapData]:
+    """Get map data for the latest processed folder
+    
+    Args:
+        folder_filter: Optional list of folder names to filter by
+    """
     if not supabase:
         return None
     
     try:
         # Get all completed folders and sort by folder name (which contains timestamp)
-        folder_result = supabase.table("qr_processed_folders").select(
-            "task_id, folder_name, s3_input_folder_url, total_images, created_at"
-        ).eq("status", "completed").execute()
+        if folder_filter:
+            folder_result = supabase.table("qr_processed_folders").select(
+                "task_id, folder_name, s3_input_folder_url, total_images, created_at"
+            ).eq("status", "completed").in_("folder_name", folder_filter).execute()
+        else:
+            folder_result = supabase.table("qr_processed_folders").select(
+                "task_id, folder_name, s3_input_folder_url, total_images, created_at"
+            ).eq("status", "completed").execute()
         
         if not folder_result.data:
             return None
@@ -821,8 +838,13 @@ def get_latest_folder_map() -> Optional[MapData]:
         logger.error(f"Error fetching latest folder map: {e}")
         return None
 
-def get_vin_movement_path(vin: str) -> VINMovementPath:
-    """Get movement path for a specific VIN across all folders"""
+def get_vin_movement_path(vin: str, folder_filter: Optional[List[str]] = None) -> VINMovementPath:
+    """Get movement path for a specific VIN across all folders
+    
+    Args:
+        vin: The VIN to get movement path for
+        folder_filter: Optional list of folder names to filter by
+    """
     if not supabase:
         raise HTTPException(status_code=500, detail="Database not available")
     
@@ -832,7 +854,7 @@ def get_vin_movement_path(vin: str) -> VINMovementPath:
             "id, filename, s3_input_url, image_signed_url, timestamp, latitude, longitude, qr_results, task_id"
         ).eq("processing_status", "success").execute()
         
-        # Get folder information
+        # Get folder information (always get all folders for proper mapping)
         folder_result = supabase.table("qr_processed_folders").select("task_id, folder_name").execute()
         folder_map = {folder["task_id"]: folder for folder in folder_result.data}
         
@@ -857,6 +879,10 @@ def get_vin_movement_path(vin: str) -> VINMovementPath:
                             image_filename=image["filename"],
                             image_url=fresh_image_url
                         ))
+        
+        # Apply folder filtering if specified
+        if folder_filter:
+            movement_points = [p for p in movement_points if p.folder_name in folder_filter]
         
         # Sort by folder chronological order (drone flight sequence)
         # Extract time from folder name for proper chronological ordering
@@ -1769,11 +1795,89 @@ async def delete_qr_code(qr_id: str):
         raise HTTPException(status_code=500, detail=f"Failed to delete QR code: {str(e)}")
 
 # VIN Tracking Endpoints
-@app.get("/vins", response_model=VINListResponse)
-async def list_all_vins():
-    """Get all unique VINs with summary information"""
+@app.get("/folders")
+async def list_folders():
+    """Get list of all available folders"""
     try:
-        vin_data = get_all_vins_from_processed_images()
+        if not supabase:
+            return {"folders": [], "total": 0}
+        
+        folder_result = supabase.table("qr_processed_folders").select(
+            "folder_name, s3_input_folder_url, total_images, created_at, status"
+        ).eq("status", "completed").execute()
+        
+        folders = []
+        for folder in folder_result.data:
+            folders.append({
+                "folder_name": folder["folder_name"],
+                "s3_url": folder["s3_input_folder_url"],
+                "total_images": folder["total_images"],
+                "created_at": folder["created_at"],
+                "status": folder["status"]
+            })
+        
+        # Sort folders by datetime extracted from folder name (most recent first)
+        def extract_datetime_from_folder_name(folder_item):
+            """Extract datetime from folder name like 'Run September 22 6:07 PM'"""
+            folder_name = folder_item["folder_name"]
+            try:
+                # Parse folder name format: "Run September 22 6:07 PM"
+                import re
+                from datetime import datetime
+                
+                # Extract date and time parts
+                match = re.match(r"Run (\w+) (\d+) (\d+):(\d+) (AM|PM)", folder_name)
+                if match:
+                    month_name, day, hour, minute, ampm = match.groups()
+                    
+                    # Convert month name to number
+                    month_map = {
+                        'January': 1, 'February': 2, 'March': 3, 'April': 4,
+                        'May': 5, 'June': 6, 'July': 7, 'August': 8,
+                        'September': 9, 'October': 10, 'November': 11, 'December': 12
+                    }
+                    month = month_map.get(month_name, 1)
+                    
+                    # Convert 12-hour to 24-hour format
+                    hour = int(hour)
+                    if ampm == 'PM' and hour != 12:
+                        hour += 12
+                    elif ampm == 'AM' and hour == 12:
+                        hour = 0
+                    
+                    # Create datetime object (assuming current year)
+                    current_year = datetime.now().year
+                    return datetime(current_year, month, int(day), hour, int(minute))
+                
+                # Fallback to created_at if parsing fails
+                return datetime.fromisoformat(folder_item["created_at"].replace('Z', '+00:00'))
+            except:
+                # Fallback to created_at if parsing fails
+                return datetime.fromisoformat(folder_item["created_at"].replace('Z', '+00:00'))
+        
+        # Sort by extracted datetime (most recent first)
+        folders.sort(key=extract_datetime_from_folder_name, reverse=True)
+        
+        return {"folders": folders, "total": len(folders)}
+        
+    except Exception as e:
+        logger.error(f"Error listing folders: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to list folders: {str(e)}")
+
+@app.get("/vins", response_model=VINListResponse)
+async def list_all_vins(folder_filter: Optional[str] = None):
+    """Get all unique VINs with summary information
+    
+    Args:
+        folder_filter: Optional comma-separated list of folder names to filter by
+    """
+    try:
+        # Parse folder filter
+        folder_list = None
+        if folder_filter:
+            folder_list = [f.strip() for f in folder_filter.split(",") if f.strip()]
+        
+        vin_data = get_all_vins_from_processed_images(folder_filter=folder_list)
         
         # Group by VIN
         vin_groups = defaultdict(list)
@@ -1786,8 +1890,53 @@ async def list_all_vins():
             # Sort by timestamp
             occurrences.sort(key=lambda x: x["spotted_at"])
             
-            # Get unique folders
+            # Get unique folders and sort by datetime
             folders = list(set([v["folder_name"] for v in occurrences]))
+            
+            # Sort folders by datetime extracted from folder name (most recent first)
+            def extract_datetime_from_folder_name(folder_name):
+                """Extract datetime from folder name like 'Run September 22 6:07 PM'"""
+                try:
+                    import re
+                    from datetime import datetime
+                    
+                    # Parse folder name format: "Run September 22 6:07 PM"
+                    match = re.match(r"Run (\w+) (\d+) (\d+):(\d+) (AM|PM)", folder_name)
+                    if match:
+                        month_name, day, hour, minute, ampm = match.groups()
+                        
+                        # Convert month name to number
+                        month_map = {
+                            'January': 1, 'February': 2, 'March': 3, 'April': 4,
+                            'May': 5, 'June': 6, 'July': 7, 'August': 8,
+                            'September': 9, 'October': 10, 'November': 11, 'December': 12
+                        }
+                        month = month_map.get(month_name, 1)
+                        
+                        # Convert 12-hour to 24-hour format
+                        hour = int(hour)
+                        if ampm == 'PM' and hour != 12:
+                            hour += 12
+                        elif ampm == 'AM' and hour == 12:
+                            hour = 0
+                        
+                        # Create datetime object (assuming current year)
+                        current_year = datetime.now().year
+                        return datetime(current_year, month, int(day), hour, int(minute))
+                    
+                    # Fallback to string sorting if parsing fails
+                    return folder_name
+                except:
+                    # Fallback to string sorting if parsing fails
+                    return folder_name
+            
+            # Sort folders by datetime extracted from folder name (most recent first)
+            try:
+                folders.sort(key=extract_datetime_from_folder_name, reverse=True)
+            except Exception as e:
+                # Fallback to string sorting if datetime sorting fails
+                logger.warning(f"Failed to sort folders by datetime, using string sort: {e}")
+                folders.sort(reverse=True)
             
             # Get latest location
             latest_location = None
@@ -1831,10 +1980,20 @@ async def list_all_vins():
         raise HTTPException(status_code=500, detail=f"Failed to list VINs: {str(e)}")
 
 @app.get("/vins/{vin}/history", response_model=VINHistoryResponse)
-async def get_vin_history(vin: str):
-    """Get detailed history for a specific VIN"""
+async def get_vin_history(vin: str, folder_filter: Optional[str] = None):
+    """Get detailed history for a specific VIN
+    
+    Args:
+        vin: The VIN to get history for
+        folder_filter: Optional comma-separated list of folder names to filter by
+    """
     try:
-        vin_data = get_all_vins_from_processed_images()
+        # Parse folder filter
+        folder_list = None
+        if folder_filter:
+            folder_list = [f.strip() for f in folder_filter.split(",") if f.strip()]
+        
+        vin_data = get_all_vins_from_processed_images(folder_filter=folder_list)
         vin_occurrences = [v for v in vin_data if v["vin"] == vin]
         
         if not vin_occurrences:
@@ -1896,20 +2055,34 @@ async def get_latest_folder_map_endpoint():
         raise HTTPException(status_code=500, detail=f"Failed to fetch latest folder map: {str(e)}")
 
 @app.get("/dashboard", response_model=VINDashboardResponse)
-async def get_vin_dashboard():
-    """Get comprehensive VIN dashboard with all VINs and latest map"""
+async def get_vin_dashboard(folders: Optional[str] = None):
+    """Get comprehensive VIN dashboard with all VINs and latest map
+    
+    Args:
+        folders: Optional comma-separated list of folder names to filter by.
+                If not provided, uses all folders.
+    """
     try:
-        # Get all VINs
-        vin_response = await list_all_vins()
+        # Parse folders parameter
+        folder_filter = None
+        if folders:
+            folder_filter = [f.strip() for f in folders.split(",") if f.strip()]
+            logger.info(f"Filtering dashboard by folders: {folder_filter}")
         
-        # Get latest map
-        latest_map = get_latest_folder_map()
+        # Get all VINs (with optional folder filtering)
+        vin_response = await list_all_vins(folder_filter=",".join(folder_filter) if folder_filter else None)
         
-        # Get total folders count
+        # Get latest map (with optional folder filtering)
+        latest_map = get_latest_folder_map(folder_filter=folder_filter)
+        
+        # Get total folders count (with optional filtering)
         total_folders = 0
         if supabase:
             try:
-                folder_result = supabase.table("qr_processed_folders").select("id", count="exact").execute()
+                if folder_filter:
+                    folder_result = supabase.table("qr_processed_folders").select("id", count="exact").in_("folder_name", folder_filter).execute()
+                else:
+                    folder_result = supabase.table("qr_processed_folders").select("id", count="exact").execute()
                 total_folders = folder_result.count or 0
             except Exception as e:
                 logger.warning(f"Could not fetch total folders count: {e}")
@@ -1926,10 +2099,20 @@ async def get_vin_dashboard():
         raise HTTPException(status_code=500, detail=f"Failed to fetch VIN dashboard: {str(e)}")
 
 @app.get("/vins/{vin}/movement", response_model=VINMovementPath)
-async def get_vin_movement_path_endpoint(vin: str):
-    """Get movement path for a specific VIN showing GPS trail over time"""
+async def get_vin_movement_path_endpoint(vin: str, folder_filter: Optional[str] = None):
+    """Get movement path for a specific VIN showing GPS trail over time
+    
+    Args:
+        vin: The VIN to get movement path for
+        folder_filter: Optional comma-separated list of folder names to filter by
+    """
     try:
-        return get_vin_movement_path(vin)
+        # Parse folder filter
+        folder_list = None
+        if folder_filter:
+            folder_list = [f.strip() for f in folder_filter.split(",") if f.strip()]
+        
+        return get_vin_movement_path(vin, folder_filter=folder_list)
     except HTTPException:
         raise
     except Exception as e:
