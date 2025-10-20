@@ -590,7 +590,8 @@ def calculate_real_world_coordinates(
     return real_world_results
 
 def decode_qr_from_base64(base64_string: str) -> Optional[str]:
-    """Decode AprilTag (tagStandard52h13) from a base64 image using external detector binary."""
+    """Decode AprilTag (tagStandard52h13) from a base64 image using external detector binary.
+    Writes a temporary PGM to match detector stability."""
     try:
         # Strip data URL prefix if present
         if base64_string.startswith('data:'):
@@ -600,18 +601,23 @@ def decode_qr_from_base64(base64_string: str) -> Optional[str]:
         image_data = base64.b64decode(base64_string)
         img = Image.open(io.BytesIO(image_data)).convert('L')
 
-        # Save to a temporary JPEG for the detector
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+        # Save to a temporary PGM for the detector (avoids JPEG loader/crash issues)
+        with tempfile.NamedTemporaryFile(suffix=".pgm", delete=False) as f:
             tmp_path = f.name
         try:
-            img.save(tmp_path, format="JPEG", quality=95)
+            img.save(tmp_path)
 
             # Execute detector
             out = subprocess.check_output([AT_EXE, tmp_path], stderr=subprocess.STDOUT, text=True)
 
-            # Expect a JSON array line like: [ { "id": ... } ]
-            line = next((l for l in out.splitlines() if l.strip().startswith('[')), '[]')
-            dets = json.loads(line)
+            # Extract JSON array even if prefixed (e.g., "###Size... [ {...} ]")
+            json_text = '[]'
+            for l in out.splitlines():
+                idx = l.find('[')
+                if idx != -1:
+                    json_text = l[idx:]
+                    break
+            dets = json.loads(json_text)
             if not dets:
                 return None
 
