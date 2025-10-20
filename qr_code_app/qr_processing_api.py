@@ -1294,25 +1294,53 @@ def assign_vin_to_qr_code(qr_code_id: str, vin: str) -> Optional[Dict[str, Any]]
         return None
 
 def generate_unique_qr_code_id() -> str:
-    """Generate a unique QR code ID"""
-    import random
-    import string
-    
-    while True:
-        # Generate 8-character alphanumeric ID
-        qr_code_id = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
-        
-        # Check if this ID already exists
-        if supabase:
+    """Generate a unique QR code ID using the DB sequence (numeric string).
+    Falls back to a locally unique value if the database is unavailable."""
+    # Prefer database-backed sequence to guarantee monotonic, non-repeating IDs
+    if supabase:
+        try:
+            # Call Postgres function generate_qr_code_id() via RPC
+            # This function should return the next sequence value as text
+            rpc_result = supabase.rpc("generate_qr_code_id", {}).execute()
+
+            # supabase-py returns the raw value in .data for scalar returns,
+            # but can vary by version; normalize to string
+            if rpc_result is not None and getattr(rpc_result, "data", None) is not None:
+                value = rpc_result.data
+                # value may be scalar, list, or dict depending on client version
+                if isinstance(value, (int, float)):
+                    return str(int(value))
+                if isinstance(value, str):
+                    return value
+                if isinstance(value, list) and value:
+                    # common pattern: [{"generate_qr_code_id": "123"}] or ["123"]
+                    first = value[0]
+                    if isinstance(first, dict):
+                        # try common keys
+                        for k in ("generate_qr_code_id", "qr_code_id", "id", "value"):
+                            if k in first and first[k] is not None:
+                                return str(first[k])
+                    return str(first)
+                if isinstance(value, dict):
+                    for k in ("generate_qr_code_id", "qr_code_id", "id", "value"):
+                        if k in value and value[k] is not None:
+                            return str(value[k])
+            # As a secondary attempt, select nextval directly if RPC isn't wired
             try:
-                result = supabase.table("qr_codes").select("qr_code_id").eq("qr_code_id", qr_code_id).execute()
-                if not result.data:
-                    return qr_code_id
-            except Exception as e:
-                logger.warning(f"Error checking QR code ID uniqueness: {e}")
-                return qr_code_id
-        else:
-            return qr_code_id
+                direct = supabase.rpc("sql", {"query": "select nextval('qr_code_id_seq')::text as id"}).execute()
+                if direct is not None and getattr(direct, "data", None):
+                    d = direct.data
+                    if isinstance(d, list) and d and isinstance(d[0], dict) and "id" in d[0]:
+                        return str(d[0]["id"])
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning(f"Falling back to local ID generation due to RPC error: {e}")
+
+    # Fallback: generate a locally unique numeric-like string using timestamp
+    # Note: This does not guarantee global monotonicity; used only if DB is unavailable
+    from time import time
+    return str(int(time() * 1000))
 
 def resolve_qr_code_to_vin(qr_content: str) -> Optional[str]:
     """Resolve QR code content (ID) to VIN number"""
