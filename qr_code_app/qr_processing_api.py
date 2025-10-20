@@ -697,39 +697,45 @@ def generate_vin_description(vin: str) -> str:
         logger.error(f"Error generating VIN description for {vin}: {e}")
         return None
 
-# QR Generation Helper Functions
+# QR (now AprilTag) Generation Helper Functions
 def generate_qr_code(data: str, size: int = 10) -> bytes:
-    """Generate ultra-high-resolution QR code as PNG bytes for professional A4 printing"""
-    # For professional A4 printing at 300 DPI, we want the QR code to be 3-4 inches
-    # That's 900-1200 pixels, so with a typical QR code being ~25x25 modules
-    # We need box_size of 36-48 for ultra-high resolution A4 printing
-    
-    # Ultra-high resolution settings for professional printing
-    print_box_size = max(60, size * 5)  # Minimum 60 for ultra-high res, or 5x the requested size
-    
-    qr = qrcode.QRCode(
-        version=1,
-        error_correction=qrcode.constants.ERROR_CORRECT_H,  # High error correction for maximum reliability
-        box_size=print_box_size,
-        border=4,  # Minimal border to maximize QR code size
-    )
-    qr.add_data(data)
-    qr.make(fit=True)
-    
-    img = qr.make_image(fill_color="black", back_color="white")
-    
-    # Convert to bytes with maximum quality settings
-    img_bytes = BytesIO()
-    img.save(img_bytes, format='PNG', optimize=False, compress_level=0, dpi=(300, 300))
-    img_bytes.seek(0)
-    
-    return img_bytes.getvalue()
+    """Generate an AprilTag (tagStandard52h13) image as PNG bytes without OpenCV.
+    Keeps the function name for compatibility with existing callers."""
+    try:
+        # Import locally to avoid hard dependency if not installed at import time
+        from moms_apriltag import TagGenerator3
+        
+        # Use numeric sequence ID directly when possible; if not numeric, derive a stable small int
+        try:
+            tag_id = int(data)
+        except ValueError:
+            tag_id = abs(hash(str(data))) % 10000
+
+        generator = TagGenerator3("tagStandard52h13")
+        tag_img = generator.generate(tag_id)  # Returns a numpy array (grayscale)
+
+        # Scale up for print quality (approx A4 height at 300 DPI)
+        from PIL import Image as _PIL_Image
+        pil_img = _PIL_Image.fromarray(tag_img)
+        base_dpi = 300
+        a4_height_inches = 11.69
+        target_side = max(512, int(base_dpi * a4_height_inches))
+        pil_img = pil_img.resize((target_side, target_side), resample=_PIL_Image.NEAREST)
+        pil_img = pil_img.convert('RGB')
+
+        buf = BytesIO()
+        pil_img.save(buf, format='PNG', optimize=False, compress_level=0, dpi=(300, 300))
+        buf.seek(0)
+        return buf.getvalue()
+    except Exception as e:
+        logger.error(f"Error generating AprilTag (tagStandard52h13): {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate AprilTag: {str(e)}")
 
 def create_s3_key_for_qr(qr_code_id: str) -> str:
-    """Create S3 key for QR code"""
+    """Create S3 key for AprilTag image (keeps name for compatibility)."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_id = qr_code_id.replace("/", "_").replace("\\", "_")
-    return f"qr_codes/{safe_id}_{timestamp}.png"
+    return f"apriltags/{safe_id}_{timestamp}.png"
 
 def upload_qr_to_s3(file_bytes: bytes, s3_key: str) -> str:
     """Upload QR code file to S3 and return the S3 URL"""
