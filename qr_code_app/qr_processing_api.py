@@ -15,6 +15,8 @@ from supabase import create_client, Client
 import logging
 import base64
 import io
+import subprocess
+import json
 from PIL import Image
 from PIL.ExifTags import TAGS, GPSTAGS
 import cv2
@@ -82,6 +84,9 @@ def get_roboflow_client():
         )
 
 app = FastAPI(title="QR Processing API", description="Simple API for processing QR codes from S3 images")
+# Path to AprilTag detector binary (tagStandard52h13 capable)
+AT_EXE = "/home/ubuntu/workflows/qr_code_app/atagjs_example"
+
 
 # Add CORS middleware
 app.add_middleware(
@@ -585,74 +590,40 @@ def calculate_real_world_coordinates(
     return real_world_results
 
 def decode_qr_from_base64(base64_string: str) -> Optional[str]:
-    """Decode QR code from base64 image string with enhanced processing"""
+    """Decode AprilTag (tagStandard52h13) from a base64 image using external detector binary."""
     try:
-        # Remove data URL prefix if present
+        # Strip data URL prefix if present
         if base64_string.startswith('data:'):
-            base64_string = base64_string.split(',')[1]
-        
-        # Decode base64 to image
+            base64_string = base64_string.split(',', 1)[1]
+
+        # Load to grayscale
         image_data = base64.b64decode(base64_string)
-        image = Image.open(io.BytesIO(image_data))
-        
-        # Convert to grayscale first (better for QR detection)
-        if image.mode != 'L':
-            image = image.convert('L')
-        
-        # Convert PIL to numpy array
-        img_array = np.array(image)
-        
-        # Try multiple processing approaches
-        processing_methods = [
-            # Method 1: Original image
-            img_array,
-            
-            # Method 2: Enhanced contrast
-            cv2.equalizeHist(img_array),
-            
-            # Method 3: Gaussian blur to reduce noise
-            cv2.GaussianBlur(img_array, (3, 3), 0),
-            
-            # Method 4: Morphological operations to clean up
-            cv2.morphologyEx(img_array, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8)),
-            
-            # Method 5: Threshold to binary
-            cv2.threshold(img_array, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1],
-            
-            # Method 6: Adaptive threshold
-            cv2.adaptiveThreshold(img_array, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2),
-        ]
-        
-        # Try each processing method
-        for i, processed_img in enumerate(processing_methods):
-            try:
-                qr_codes = pyzbar.decode(processed_img)
-                if qr_codes:
-                    content = qr_codes[0].data.decode('utf-8')
-                    logger.info(f"QR decoded successfully using method {i+1}: {content[:50]}...")
-                    return content
-            except Exception as method_error:
-                logger.debug(f"Method {i+1} failed: {str(method_error)}")
-                continue
-        
-        # If all methods fail, try resizing the image
+        img = Image.open(io.BytesIO(image_data)).convert('L')
+
+        # Save to a temporary JPEG for the detector
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+            tmp_path = f.name
         try:
-            # Scale up the image 2x for better detection
-            height, width = img_array.shape
-            scaled_img = cv2.resize(img_array, (width * 2, height * 2), interpolation=cv2.INTER_CUBIC)
-            qr_codes = pyzbar.decode(scaled_img)
-            if qr_codes:
-                content = qr_codes[0].data.decode('utf-8')
-                logger.info(f"QR decoded successfully using scaling: {content[:50]}...")
-                return content
-        except Exception as scale_error:
-            logger.debug(f"Scaling method failed: {str(scale_error)}")
-        
-        logger.warning("All QR decoding methods failed")
-        return None
-        
+            img.save(tmp_path, format="JPEG", quality=95)
+
+            # Execute detector
+            out = subprocess.check_output([AT_EXE, tmp_path], stderr=subprocess.STDOUT, text=True)
+
+            # Expect a JSON array line like: [ { "id": ... } ]
+            line = next((l for l in out.splitlines() if l.strip().startswith('[')), '[]')
+            dets = json.loads(line)
+            if not dets:
+                return None
+
+            # Return first tag id as string
+            return str(dets[0].get("id"))
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
     except Exception as e:
-        logger.warning(f"Could not decode QR code: {str(e)}")
+        logger.warning(f"Could not decode AprilTag: {str(e)}")
         return None
 
 # AI VIN Description Generation
