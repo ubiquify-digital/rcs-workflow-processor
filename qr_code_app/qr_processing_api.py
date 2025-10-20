@@ -126,19 +126,21 @@ class QRProcessResponse(BaseModel):
 
 # QR Generation Models
 class QRGenerateRequest(BaseModel):
-    vin: str
     description: Optional[str] = None
     size: int = 20  # Ultra-high resolution default for professional A4 printing
 
 class QRCodeRecord(BaseModel):
     id: str
-    vin: str
+    qr_code_id: str  # The ID encoded in the QR code
+    vin: Optional[str]  # Can be None if not assigned
     description: Optional[str]
     ai_description: Optional[str]
     s3_url: str
     image_url: str  # Signed URL
     created_at: datetime
+    assigned_at: Optional[datetime]  # When VIN was assigned
     size: int
+    is_active: bool
 
 class QRGenerateResponse(BaseModel):
     success: bool
@@ -148,6 +150,27 @@ class QRGenerateResponse(BaseModel):
 class QRListResponse(BaseModel):
     qr_codes: List[QRCodeRecord]
     total: int
+
+# QR Reassignment Models
+class QRReassignRequest(BaseModel):
+    qr_code_id: str
+    vin: str
+
+class QRReassignResponse(BaseModel):
+    success: bool
+    qr_code: QRCodeRecord
+    message: str
+
+# Combined Generate and Assign Models
+class QRGenerateAndAssignRequest(BaseModel):
+    vin: str
+    description: Optional[str] = None
+    size: int = 20
+
+class QRGenerateAndAssignResponse(BaseModel):
+    success: bool
+    qr_code: QRCodeRecord
+    message: str
 
 # VIN Tracking Models
 class VINHistory(BaseModel):
@@ -504,11 +527,11 @@ def generate_qr_code(data: str, size: int = 10) -> bytes:
     
     return img_bytes.getvalue()
 
-def create_s3_key_for_qr(vin: str) -> str:
+def create_s3_key_for_qr(qr_code_id: str) -> str:
     """Create S3 key for QR code"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_vin = vin.replace("/", "_").replace("\\", "_")
-    return f"qr_codes/{safe_vin}_{timestamp}.png"
+    safe_id = qr_code_id.replace("/", "_").replace("\\", "_")
+    return f"qr_codes/{safe_id}_{timestamp}.png"
 
 def upload_qr_to_s3(file_bytes: bytes, s3_key: str) -> str:
     """Upload QR code file to S3 and return the S3 URL"""
@@ -527,8 +550,8 @@ def upload_qr_to_s3(file_bytes: bytes, s3_key: str) -> str:
         logger.error(f"Error uploading QR to S3: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to upload QR to S3: {str(e)}")
 
-def store_qr_record(vin: str, description: Optional[str], ai_description: Optional[str], s3_url: str, size: int) -> str:
-    """Store QR code record in database"""
+def store_qr_record(qr_code_id: str, description: Optional[str], s3_url: str, size: int) -> str:
+    """Store QR code record in database with ID-based system"""
     if not supabase:
         logger.warning("Supabase not available, skipping database storage")
         return str(uuid.uuid4())
@@ -537,16 +560,19 @@ def store_qr_record(vin: str, description: Optional[str], ai_description: Option
         record_id = str(uuid.uuid4())
         record = {
             "id": record_id,
-            "vin": vin,
+            "qr_code_id": qr_code_id,
+            "vin": None,  # VIN will be assigned later
             "description": description,
-            "ai_description": ai_description,
+            "ai_description": None,  # Will be generated when VIN is assigned
             "s3_url": s3_url,
             "size": size,
-            "created_at": datetime.now().isoformat()
+            "created_at": datetime.now().isoformat(),
+            "assigned_at": None,
+            "is_active": True
         }
         
         result = supabase.table("qr_codes").insert(record).execute()
-        logger.info(f"Stored QR record in database: {record_id}")
+        logger.info(f"Stored QR record in database: {record_id} with QR code ID: {qr_code_id}")
         return record_id
     except Exception as e:
         logger.error(f"Error storing QR record: {e}")
@@ -679,10 +705,13 @@ def get_all_vins_from_processed_images(folder_filter: Optional[List[str]] = None
                 
                 for qr in image["qr_results"]:
                     content = qr.get("content", "")
-                    # Accept VINs (17 chars) and other vehicle identifiers (8-20 chars, alphanumeric)
-                    if content and 8 <= len(content) <= 20 and content.replace("-", "").replace("_", "").isalnum():
+                    # Resolve QR code content to VIN (handles both direct VINs and QR code IDs)
+                    resolved_vin = resolve_qr_code_to_vin(content)
+                    
+                    if resolved_vin:
                         vin_data.append({
-                            "vin": qr["content"],
+                            "vin": resolved_vin,
+                            "qr_code_id": content if len(content) != 17 else None,  # Store original QR code ID if not a direct VIN
                             "confidence": qr.get("confidence", 0.0),
                             "image_filename": image["filename"],
                             "image_url": fresh_image_url,
@@ -788,10 +817,13 @@ def get_latest_folder_map(folder_filter: Optional[List[str]] = None) -> Optional
                 
                 for qr in image["qr_results"]:
                     content = qr.get("content", "")
-                    # Accept VINs (17 chars) and other vehicle identifiers (8-20 chars, alphanumeric)
-                    if content and 8 <= len(content) <= 20 and content.replace("-", "").replace("_", "").isalnum():
+                    # Resolve QR code content to VIN (handles both direct VINs and QR code IDs)
+                    resolved_vin = resolve_qr_code_to_vin(content)
+                    
+                    if resolved_vin:
                         all_points.append({
-                            "vin": qr["content"],
+                            "vin": resolved_vin,
+                            "qr_code_id": content if len(content) != 17 else None,  # Store original QR code ID if not a direct VIN
                             "latitude": float(image["latitude"]),
                             "longitude": float(image["longitude"]),
                             "image_url": fresh_image_url,
@@ -869,7 +901,9 @@ def get_vin_movement_path(vin: str, folder_filter: Optional[List[str]] = None) -
                 
                 for qr in image["qr_results"]:
                     content = qr.get("content", "")
-                    if content == vin:  # Match exact VIN
+                    # Resolve QR code content to VIN and check if it matches the target VIN
+                    resolved_vin = resolve_qr_code_to_vin(content)
+                    if resolved_vin == vin:  # Match resolved VIN
                         movement_points.append(MovementPoint(
                             latitude=float(image["latitude"]),
                             longitude=float(image["longitude"]),
@@ -1012,7 +1046,7 @@ def get_vin_movement_path(vin: str, folder_filter: Optional[List[str]] = None) -
         raise HTTPException(status_code=500, detail=f"Failed to fetch movement path: {str(e)}")
 
 def get_qr_record_by_id(record_id: str) -> Optional[Dict[str, Any]]:
-    """Get specific QR code record by ID"""
+    """Get specific QR code record by database ID"""
     if not supabase:
         return None
     
@@ -1022,6 +1056,85 @@ def get_qr_record_by_id(record_id: str) -> Optional[Dict[str, Any]]:
     except Exception as e:
         logger.error(f"Error fetching QR record {record_id}: {e}")
         return None
+
+def get_qr_record_by_qr_code_id(qr_code_id: str) -> Optional[Dict[str, Any]]:
+    """Get QR code record by QR code ID (the ID encoded in the QR)"""
+    if not supabase:
+        return None
+    
+    try:
+        result = supabase.table("qr_codes").select("*").eq("qr_code_id", qr_code_id).eq("is_active", True).execute()
+        return result.data[0] if result.data else None
+    except Exception as e:
+        logger.error(f"Error fetching QR record by QR code ID {qr_code_id}: {e}")
+        return None
+
+def assign_vin_to_qr_code(qr_code_id: str, vin: str) -> Optional[Dict[str, Any]]:
+    """Assign a VIN to a QR code"""
+    if not supabase:
+        return None
+    
+    try:
+        # Generate AI description for the VIN
+        ai_description = generate_vin_description(vin)
+        
+        # Update the QR code record
+        result = supabase.table("qr_codes").update({
+            "vin": vin,
+            "ai_description": ai_description,
+            "assigned_at": datetime.now().isoformat()
+        }).eq("qr_code_id", qr_code_id).eq("is_active", True).execute()
+        
+        if result.data:
+            logger.info(f"Assigned VIN {vin} to QR code {qr_code_id}")
+            return result.data[0]
+        else:
+            logger.warning(f"QR code {qr_code_id} not found or not active")
+            return None
+    except Exception as e:
+        logger.error(f"Error assigning VIN {vin} to QR code {qr_code_id}: {e}")
+        return None
+
+def generate_unique_qr_code_id() -> str:
+    """Generate a unique QR code ID"""
+    import random
+    import string
+    
+    while True:
+        # Generate 8-character alphanumeric ID
+        qr_code_id = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+        
+        # Check if this ID already exists
+        if supabase:
+            try:
+                result = supabase.table("qr_codes").select("qr_code_id").eq("qr_code_id", qr_code_id).execute()
+                if not result.data:
+                    return qr_code_id
+            except Exception as e:
+                logger.warning(f"Error checking QR code ID uniqueness: {e}")
+                return qr_code_id
+        else:
+            return qr_code_id
+
+def resolve_qr_code_to_vin(qr_content: str) -> Optional[str]:
+    """Resolve QR code content (ID) to VIN number"""
+    if not qr_content:
+        return None
+    
+    # Check if the content is already a VIN (17 characters, alphanumeric)
+    if len(qr_content) == 17 and qr_content.isalnum():
+        return qr_content
+    
+    # Otherwise, treat it as a QR code ID and look up the VIN
+    if supabase:
+        try:
+            result = supabase.table("qr_codes").select("vin").eq("qr_code_id", qr_content).eq("is_active", True).execute()
+            if result.data and result.data[0].get("vin"):
+                return result.data[0]["vin"]
+        except Exception as e:
+            logger.warning(f"Error resolving QR code ID {qr_content} to VIN: {e}")
+    
+    return None
 
 @app.get("/")
 async def root():
@@ -1645,18 +1758,18 @@ async def reprocess_folder(request: QRProcessRequest):
 # QR Generation Endpoints
 @app.post("/generate-qr", response_model=QRGenerateResponse)
 async def generate_qr(request: QRGenerateRequest):
-    """Generate QR code for VIN number with AI description"""
+    """Generate QR code with unique ID (VIN assignment happens later)"""
     try:
-        logger.info(f"Generating QR code for VIN: {request.vin}")
+        logger.info("Generating QR code with unique ID")
         
-        # Generate AI description
-        ai_description = generate_vin_description(request.vin)
+        # Generate unique QR code ID
+        qr_code_id = generate_unique_qr_code_id()
         
-        # Generate QR code
-        qr_bytes = generate_qr_code(request.vin, request.size)
+        # Generate QR code with the ID (not VIN)
+        qr_bytes = generate_qr_code(qr_code_id, request.size)
         
         # Create S3 key
-        s3_key = create_s3_key_for_qr(request.vin)
+        s3_key = create_s3_key_for_qr(qr_code_id)
         
         # Upload to S3
         s3_url = upload_qr_to_s3(qr_bytes, s3_key)
@@ -1664,25 +1777,28 @@ async def generate_qr(request: QRGenerateRequest):
         # Generate signed URL
         image_url = get_s3_signed_url(s3_url)
         
-        # Store in database
-        record_id = store_qr_record(request.vin, request.description, ai_description, s3_url, request.size)
+        # Store in database (without VIN initially)
+        record_id = store_qr_record(qr_code_id, request.description, s3_url, request.size)
         
         # Create response
         qr_record = QRCodeRecord(
             id=record_id,
-            vin=request.vin,
+            qr_code_id=qr_code_id,
+            vin=None,  # Not assigned yet
             description=request.description,
-            ai_description=ai_description,
+            ai_description=None,  # Will be generated when VIN is assigned
             s3_url=s3_url,
             image_url=image_url,
             created_at=datetime.now(),
-            size=request.size
+            assigned_at=None,
+            size=request.size,
+            is_active=True
         )
         
         return QRGenerateResponse(
             success=True,
             qr_code=qr_record,
-            message=f"QR code generated successfully for VIN: {request.vin}"
+            message=f"QR code generated successfully with ID: {qr_code_id}. Use /reassign-qr to assign a VIN."
         )
         
     except Exception as e:
@@ -1711,15 +1827,23 @@ async def list_qr_codes(
                 logger.warning(f"Failed to generate signed URL for {record['id']}: {e}")
                 image_url = "URL_EXPIRED"
             
+            # Parse assigned_at if it exists
+            assigned_at = None
+            if record.get("assigned_at"):
+                assigned_at = datetime.fromisoformat(record["assigned_at"].replace('Z', '+00:00'))
+            
             qr_code = QRCodeRecord(
                 id=record["id"],
-                vin=record["vin"],
+                qr_code_id=record["qr_code_id"],
+                vin=record.get("vin"),
                 description=record.get("description"),
                 ai_description=record.get("ai_description"),
                 s3_url=record["s3_url"],
                 image_url=image_url,
                 created_at=datetime.fromisoformat(record["created_at"].replace('Z', '+00:00')),
-                size=record["size"]
+                assigned_at=assigned_at,
+                size=record["size"],
+                is_active=record.get("is_active", True)
             )
             qr_codes.append(qr_code)
         
@@ -1793,6 +1917,133 @@ async def delete_qr_code(qr_id: str):
     except Exception as e:
         logger.error(f"Error deleting QR code {qr_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to delete QR code: {str(e)}")
+
+@app.post("/reassign-qr", response_model=QRReassignResponse)
+async def reassign_qr_code(request: QRReassignRequest):
+    """Assign or reassign a VIN to a QR code"""
+    try:
+        logger.info(f"Reassigning QR code {request.qr_code_id} to VIN {request.vin}")
+        
+        # Get the QR code record
+        record = get_qr_record_by_qr_code_id(request.qr_code_id)
+        if not record:
+            raise HTTPException(status_code=404, detail=f"QR code {request.qr_code_id} not found")
+        
+        # Assign the VIN
+        updated_record = assign_vin_to_qr_code(request.qr_code_id, request.vin)
+        if not updated_record:
+            raise HTTPException(status_code=500, detail="Failed to assign VIN to QR code")
+        
+        # Generate fresh signed URL
+        try:
+            image_url = get_s3_signed_url(updated_record["s3_url"])
+        except Exception as e:
+            logger.warning(f"Failed to generate signed URL for {updated_record['id']}: {e}")
+            image_url = "URL_EXPIRED"
+        
+        # Parse assigned_at if it exists
+        assigned_at = None
+        if updated_record.get("assigned_at"):
+            assigned_at = datetime.fromisoformat(updated_record["assigned_at"].replace('Z', '+00:00'))
+        
+        # Create response
+        qr_record = QRCodeRecord(
+            id=updated_record["id"],
+            qr_code_id=updated_record["qr_code_id"],
+            vin=updated_record["vin"],
+            description=updated_record.get("description"),
+            ai_description=updated_record.get("ai_description"),
+            s3_url=updated_record["s3_url"],
+            image_url=image_url,
+            created_at=datetime.fromisoformat(updated_record["created_at"].replace('Z', '+00:00')),
+            assigned_at=assigned_at,
+            size=updated_record["size"],
+            is_active=updated_record.get("is_active", True)
+        )
+        
+        return QRReassignResponse(
+            success=True,
+            qr_code=qr_record,
+            message=f"QR code {request.qr_code_id} successfully assigned to VIN {request.vin}"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error reassigning QR code: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to reassign QR code: {str(e)}")
+
+@app.post("/generate-and-assign-qr", response_model=QRGenerateAndAssignResponse)
+async def generate_and_assign_qr(request: QRGenerateAndAssignRequest):
+    """Generate QR code and assign VIN in one step"""
+    try:
+        logger.info(f"Generating and assigning QR code for VIN: {request.vin}")
+        
+        # Generate unique QR code ID
+        qr_code_id = generate_unique_qr_code_id()
+        
+        # Generate QR code with the ID
+        qr_bytes = generate_qr_code(qr_code_id, request.size)
+        
+        # Create S3 key
+        s3_key = create_s3_key_for_qr(qr_code_id)
+        
+        # Upload to S3
+        s3_url = upload_qr_to_s3(qr_bytes, s3_key)
+        
+        # Generate signed URL
+        image_url = get_s3_signed_url(s3_url)
+        
+        # Generate AI description for the VIN
+        ai_description = generate_vin_description(request.vin)
+        
+        # Store in database with VIN already assigned
+        record_id = str(uuid.uuid4())
+        if supabase:
+            try:
+                record = {
+                    "id": record_id,
+                    "qr_code_id": qr_code_id,
+                    "vin": request.vin,
+                    "description": request.description,
+                    "ai_description": ai_description,
+                    "s3_url": s3_url,
+                    "size": request.size,
+                    "created_at": datetime.now().isoformat(),
+                    "assigned_at": datetime.now().isoformat(),
+                    "is_active": True
+                }
+                
+                result = supabase.table("qr_codes").insert(record).execute()
+                logger.info(f"Stored QR record with VIN assignment: {record_id}")
+            except Exception as e:
+                logger.error(f"Error storing QR record: {e}")
+                raise HTTPException(status_code=500, detail=f"Failed to store QR record: {str(e)}")
+        
+        # Create response
+        qr_record = QRCodeRecord(
+            id=record_id,
+            qr_code_id=qr_code_id,
+            vin=request.vin,
+            description=request.description,
+            ai_description=ai_description,
+            s3_url=s3_url,
+            image_url=image_url,
+            created_at=datetime.now(),
+            assigned_at=datetime.now(),
+            size=request.size,
+            is_active=True
+        )
+        
+        return QRGenerateAndAssignResponse(
+            success=True,
+            qr_code=qr_record,
+            message=f"QR code generated and assigned to VIN {request.vin} successfully"
+        )
+        
+    except Exception as e:
+        logger.error(f"Error generating and assigning QR code: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate and assign QR code: {str(e)}")
 
 # VIN Tracking Endpoints
 @app.get("/folders")
