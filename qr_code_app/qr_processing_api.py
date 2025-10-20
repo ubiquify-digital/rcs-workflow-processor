@@ -113,6 +113,7 @@ class ImageQRResult(BaseModel):
     image_url: str  # Signed S3 URL for the image
     image_coordinates: Optional[Dict[str, float]] = None
     qr_results: List[QRResult] = []
+    real_world_coordinates: Optional[List[Dict[str, float]]] = None
     success: bool
     error: Optional[str] = None
 
@@ -325,58 +326,120 @@ def get_s3_signed_url(s3_url: str) -> str:
         raise HTTPException(status_code=500, detail=f"S3 URL processing failed: {str(e)}")
 
 def extract_gps_from_image(s3_url: str) -> Optional[Dict[str, float]]:
-    """Extract GPS coordinates from image EXIF data"""
+    """Extract GPS coordinates and drone metadata from image EXIF data using exifread"""
     try:
         # Get signed URL and download image
         https_url = get_s3_signed_url(s3_url)
         response = requests.get(https_url)
         response.raise_for_status()
         
-        # Open image and extract EXIF
-        image = Image.open(io.BytesIO(response.content))
-        exif_dict = image.getexif()
+        # Use exifread for comprehensive EXIF extraction
+        import exifread
+        image_file = io.BytesIO(response.content)
+        tags = exifread.process_file(image_file, details=True)
         
-        if exif_dict:
-            # Extract GPS data using GPS IFD (the correct method)
-            gps_ifd = exif_dict.get_ifd(0x8825)  # GPS IFD tag
-            if gps_ifd:
-                logger.info(f"📍 Found GPS data in image")
+        # Extract GPS coordinates
+        latitude = None
+        longitude = None
+        altitude = None
+        
+        # Extract GPS data using exifread
+        if 'GPS GPSLatitude' in tags and 'GPS GPSLongitude' in tags:
+            # Convert DMS to decimal degrees
+            lat_dms = tags['GPS GPSLatitude']
+            lon_dms = tags['GPS GPSLongitude']
+            lat_ref = str(tags.get('GPS GPSLatitudeRef', 'N'))
+            lon_ref = str(tags.get('GPS GPSLongitudeRef', 'E'))
+            
+            # Convert to decimal degrees
+            lat_decimal = float(lat_dms.values[0]) + float(lat_dms.values[1])/60.0 + float(lat_dms.values[2])/3600.0
+            lon_decimal = float(lon_dms.values[0]) + float(lon_dms.values[1])/60.0 + float(lon_dms.values[2])/3600.0
+            
+            if lat_ref == 'S':
+                lat_decimal = -lat_decimal
+            if lon_ref == 'W':
+                lon_decimal = -lon_decimal
                 
-                # Get GPS coordinates using numeric tags
-                gps_latitude = gps_ifd.get(2)      # GPSLatitude
-                gps_latitude_ref = gps_ifd.get(1)  # GPSLatitudeRef
-                gps_longitude = gps_ifd.get(4)     # GPSLongitude  
-                gps_longitude_ref = gps_ifd.get(3) # GPSLongitudeRef
-                
-                if gps_latitude and gps_longitude:
-                    lat = convert_to_degrees(gps_latitude)
-                    lon = convert_to_degrees(gps_longitude)
-                    
-                    # Apply hemisphere corrections
-                    if gps_latitude_ref and gps_latitude_ref.upper() == 'S':
-                        lat = -lat
-                    if gps_longitude_ref and gps_longitude_ref.upper() == 'W':
-                        lon = -lon
-                    
-                    # Validate coordinates are reasonable
-                    if -90 <= lat <= 90 and -180 <= lon <= 180:
-                        logger.info(f"📍 GPS coordinates extracted: {lat:.6f}, {lon:.6f}")
-                        return {'latitude': lat, 'longitude': lon}
-                    else:
-                        logger.warning(f"Invalid GPS coordinates: lat={lat}, lon={lon}")
-                        return None
-                else:
-                    logger.info("📍 GPS data found but latitude/longitude missing")
-                    return None
-            else:
-                logger.info("📍 No GPS IFD found in image EXIF")
-                return None
-        else:
-            logger.info("📍 No EXIF data found in image")
+            latitude = lat_decimal
+            longitude = lon_decimal
+        
+        # Extract altitude
+        if 'GPS GPSAltitude' in tags:
+            altitude_tag = tags['GPS GPSAltitude']
+            altitude = float(altitude_tag.values[0]) if hasattr(altitude_tag, 'values') else float(altitude_tag)
+        
+        if not latitude or not longitude:
+            logger.warning("No GPS coordinates found in EXIF data")
             return None
         
+        # Extract drone metadata from EXIF
+        drone_metadata = {}
+        
+        # Get altitude
+        if altitude:
+            drone_metadata['altitude'] = altitude
+        
+        # Extract camera parameters from EXIF
+        if 'EXIF FocalLength' in tags:
+            focal_tag = tags['EXIF FocalLength']
+            focal_length = float(focal_tag.values[0]) if hasattr(focal_tag, 'values') else float(focal_tag)
+            drone_metadata['focal_length'] = focal_length
+        
+        if 'EXIF DigitalZoomRatio' in tags:
+            zoom_tag = tags['EXIF DigitalZoomRatio']
+            digital_zoom = float(zoom_tag.values[0]) if hasattr(zoom_tag, 'values') else float(zoom_tag)
+            drone_metadata['digital_zoom_ratio'] = digital_zoom
+        
+        if 'EXIF ExifImageWidth' in tags:
+            width_tag = tags['EXIF ExifImageWidth']
+            image_width = int(width_tag.values[0]) if hasattr(width_tag, 'values') else int(width_tag)
+            drone_metadata['image_width'] = image_width
+        
+        if 'EXIF ExifImageLength' in tags:
+            height_tag = tags['EXIF ExifImageLength']
+            image_height = int(height_tag.values[0]) if hasattr(height_tag, 'values') else int(height_tag)
+            drone_metadata['image_height'] = image_height
+        
+        # Calculate FOV from focal length (approximate)
+        if 'focal_length' in drone_metadata:
+            # DJI M3TD has approximately 12.8° FOV at 29.9mm
+            focal_length = drone_metadata['focal_length']
+            base_fov = 12.8
+            base_focal = 29.9
+            drone_metadata['fov'] = base_fov * (base_focal / focal_length)
+        else:
+            drone_metadata['fov'] = 12.8  # Default FOV
+        
+        # Set default values for missing drone orientation data
+        # (These would need to be extracted from DJI-specific EXIF tags if available)
+        drone_metadata['yaw'] = 0.0
+        drone_metadata['pitch'] = 0.0
+        drone_metadata['roll'] = 0.0
+        drone_metadata['gimbal_yaw'] = 0.0
+        drone_metadata['gimbal_pitch'] = -90.0  # Nadir (pointing down)
+        drone_metadata['gimbal_roll'] = 0.0
+        
+        # Set default flight dynamics
+        drone_metadata['flight_x_speed'] = 0.0
+        drone_metadata['flight_y_speed'] = 0.0
+        drone_metadata['flight_z_speed'] = 0.0
+        drone_metadata['relative_altitude'] = 0.0
+        drone_metadata['sensor_temperature'] = 0.0
+        drone_metadata['gps_status'] = str(tags.get('GPS GPSStatus', 'Unknown'))
+        
+        logger.info(f"📍 GPS coordinates extracted: {latitude:.6f}, {longitude:.6f}")
+        logger.info(f"📍 Drone altitude: {drone_metadata.get('altitude', 'unknown')}m")
+        logger.info(f"📍 Camera FOV: {drone_metadata.get('fov', 'unknown')}°")
+        logger.info(f"📍 Digital zoom: {drone_metadata.get('digital_zoom_ratio', 'unknown')}x")
+        
+        return {
+            'latitude': latitude,
+            'longitude': longitude,
+            'drone_metadata': drone_metadata
+        }
+        
     except Exception as e:
-        logger.warning(f"Could not extract GPS data: {str(e)}")
+        logger.error(f"Failed to extract GPS from image {s3_url}: {str(e)}")
         return None
 
 def convert_to_degrees(value):
@@ -385,6 +448,141 @@ def convert_to_degrees(value):
         d, m, s = value
         return float(d) + float(m)/60 + float(s)/3600
     return 0.0
+
+def calculate_real_world_coordinates(
+    image_coordinates: Dict[str, float],
+    predictions: List[Dict],
+    image_width: int = 4000,
+    image_height: int = 3000
+) -> List[Dict[str, Any]]:
+    """
+    Calculate real-world GPS coordinates for QR code detections using actual drone metadata.
+    
+    Args:
+        image_coordinates: Drone GPS coordinates and metadata from EXIF
+        predictions: Roboflow predictions with bounding boxes
+        image_width: Image width in pixels (fallback)
+        image_height: Image height in pixels (fallback)
+        
+    Returns:
+        List of QR results with real-world coordinates
+    """
+    if not image_coordinates or not predictions:
+        return []
+    
+    real_world_results = []
+    drone_lat = image_coordinates['latitude']
+    drone_lon = image_coordinates['longitude']
+    
+    # Get drone metadata from EXIF
+    drone_metadata = image_coordinates.get('drone_metadata', {})
+    
+    # Use actual values from EXIF, with fallbacks
+    altitude = drone_metadata.get('altitude', 30.0)
+    relative_altitude = drone_metadata.get('relative_altitude', 0.0)
+    
+    # Use gimbal yaw if available (more accurate for camera orientation), otherwise drone yaw
+    yaw = drone_metadata.get('gimbal_yaw', drone_metadata.get('yaw', 0.0))
+    pitch = drone_metadata.get('gimbal_pitch', drone_metadata.get('pitch', 0.0))
+    roll = drone_metadata.get('gimbal_roll', drone_metadata.get('roll', 0.0))
+    
+    # Calculate effective FOV considering digital zoom
+    base_fov = drone_metadata.get('fov', 12.8)
+    digital_zoom_ratio = drone_metadata.get('digital_zoom_ratio', 1.0)
+    fov = base_fov / digital_zoom_ratio  # Digital zoom reduces effective FOV
+    
+    actual_width = drone_metadata.get('image_width', image_width)
+    actual_height = drone_metadata.get('image_height', image_height)
+    
+    # Get flight dynamics for potential motion compensation
+    flight_x_speed = drone_metadata.get('flight_x_speed', 0.0)
+    flight_y_speed = drone_metadata.get('flight_y_speed', 0.0)
+    flight_z_speed = drone_metadata.get('flight_z_speed', 0.0)
+    
+    # Get environmental factors
+    sensor_temp = drone_metadata.get('sensor_temperature', 0.0)
+    gps_status = drone_metadata.get('gps_status', 'Unknown')
+    
+    logger.info(f"📍 Using enhanced drone metadata:")
+    logger.info(f"   Altitude: {altitude}m (relative: {relative_altitude}m)")
+    logger.info(f"   Orientation: yaw={yaw}°, pitch={pitch}°, roll={roll}°")
+    logger.info(f"   FOV: {fov:.2f}° (base: {base_fov}°, zoom: {digital_zoom_ratio}x)")
+    logger.info(f"   GPS Status: {gps_status}, Sensor Temp: {sensor_temp}°C")
+    logger.info(f"   Flight Speed: X={flight_x_speed}m/s, Y={flight_y_speed}m/s, Z={flight_z_speed}m/s")
+    
+    for prediction in predictions:
+        # Extract bounding box coordinates from Roboflow prediction
+        # Roboflow format: x, y are center coordinates in pixels
+        detection_center_x = prediction.get('x', actual_width / 2)  # Center x in pixels
+        detection_center_y = prediction.get('y', actual_height / 2)  # Center y in pixels
+        bbox_width = prediction.get('width', 0)
+        bbox_height = prediction.get('height', 0)
+        
+        logger.info(f"📍 QR detection at pixel ({detection_center_x:.1f}, {detection_center_y:.1f}) size {bbox_width}x{bbox_height}")
+        
+        # Calculate GPS coordinates using pixel to GPS conversion
+        try:
+            # Step 1: Normalize detection coordinates to [-1, 1] relative to image center
+            center_x = actual_width / 2
+            center_y = actual_height / 2
+            offset_x = detection_center_x - center_x
+            offset_y = detection_center_y - center_y
+            normalized_x = offset_x / (actual_width / 2)
+            normalized_y = offset_y / (actual_height / 2)
+            
+            # Step 2: Convert normalized offsets to camera angles using actual FOV
+            fov_rad = math.radians(fov)
+            horizontal_angle = normalized_x * (fov_rad / 2)
+            vertical_angle = normalized_y * (fov_rad / 2)
+            
+            # Step 3: Estimate ground offsets using actual altitude and camera angles
+            # Use gimbal pitch/roll for camera orientation, but limit extreme values
+            gimbal_pitch = drone_metadata.get('gimbal_pitch', pitch)
+            gimbal_roll = drone_metadata.get('gimbal_roll', roll)
+            
+            # Limit pitch/roll to reasonable values to avoid extreme calculations
+            gimbal_pitch = max(-45, min(45, gimbal_pitch))  # Limit to ±45°
+            gimbal_roll = max(-45, min(45, gimbal_roll))    # Limit to ±45°
+            
+            pitch_rad = math.radians(gimbal_pitch)
+            roll_rad = math.radians(gimbal_roll)
+            
+            # Calculate ground offsets with moderate pitch/roll compensation
+            dx = altitude * math.tan(horizontal_angle) / max(0.1, math.cos(pitch_rad))
+            dy = altitude * math.tan(vertical_angle) / max(0.1, math.cos(roll_rad))
+            
+            # Step 4: Rotate offsets by actual gimbal yaw (inverted for correct coordinate system)
+            yaw_rad = math.radians(yaw + 180)  # Invert yaw for correct coordinate system
+            cos_yaw = math.cos(yaw_rad)
+            sin_yaw = math.sin(yaw_rad)
+            rotated_dx = dx * cos_yaw - dy * sin_yaw
+            rotated_dy = dx * sin_yaw + dy * cos_yaw
+            
+            # Use the rotated values directly (skip additional pitch/roll compensation for now)
+            final_dx = rotated_dx
+            final_dy = rotated_dy
+            
+            # Step 5: Convert meter offsets to GPS deltas using Earth radius and latitude
+            EARTH_RADIUS = 6371000  # Earth radius in meters
+            lat_rad = math.radians(drone_lat)
+            latitude_delta = math.degrees(final_dy / EARTH_RADIUS)
+            longitude_delta = math.degrees(final_dx / (EARTH_RADIUS * math.cos(lat_rad)))
+            
+            # Step 6: Add deltas to drone GPS to get estimated detection coordinates
+            qr_lat = drone_lat + latitude_delta
+            qr_lon = drone_lon + longitude_delta
+            
+            real_world_results.append({
+                'latitude': qr_lat,
+                'longitude': qr_lon,
+                'confidence': prediction.get('confidence', 0.0)
+            })
+            
+        except Exception as e:
+            logger.warning(f"Failed to calculate real-world coordinates: {e}")
+            continue
+    
+    return real_world_results
 
 def decode_qr_from_base64(base64_string: str) -> Optional[str]:
     """Decode QR code from base64 image string with enhanced processing"""
@@ -1424,6 +1622,8 @@ def store_image_result(task_id: str, s3_image_url: str, image_result: ImageQRRes
             }
             for qr in image_result.qr_results
         ]
+
+        # Note: Real-world coordinate calculation moved to process_single_image where predictions are available
         
         supabase.table('qr_processed_images').insert({
             'task_id': task_id,
@@ -1431,8 +1631,11 @@ def store_image_result(task_id: str, s3_image_url: str, image_result: ImageQRRes
             's3_input_url': s3_image_url,
             'image_signed_url': image_result.image_url,
             'timestamp': datetime.now().isoformat(),
-            'latitude': image_result.image_coordinates.get('latitude') if image_result.image_coordinates else None,
-            'longitude': image_result.image_coordinates.get('longitude') if image_result.image_coordinates else None,
+            # Store real-world coordinates if available, otherwise use image coordinates
+            'latitude': (image_result.real_world_coordinates[0]['latitude'] if image_result.real_world_coordinates 
+                        else image_result.image_coordinates.get('latitude') if image_result.image_coordinates else None),
+            'longitude': (image_result.real_world_coordinates[0]['longitude'] if image_result.real_world_coordinates 
+                         else image_result.image_coordinates.get('longitude') if image_result.image_coordinates else None),
             'qr_results': qr_results_json,
             'processing_status': 'success' if image_result.success else 'failed',
             'error_message': image_result.error,
@@ -1519,6 +1722,17 @@ async def process_single_image(s3_image_url: str) -> ImageQRResult:
             
             logger.info(f"Found {len(crop_outputs)} QR code detections in {image_name}")
             
+            # Calculate real-world coordinates for QR detections
+            real_world_coordinates = []
+            if image_coordinates and predictions:
+                real_world_coordinates = calculate_real_world_coordinates(
+                    image_coordinates,
+                    predictions,
+                    4000,  # image_width
+                    3000   # image_height
+                )
+                logger.info(f"📍 Calculated {len(real_world_coordinates)} real-world coordinates")
+            
             for i, crop_base64 in enumerate(crop_outputs):
                 qr_content = decode_qr_from_base64(crop_base64)
                 if qr_content:
@@ -1534,6 +1748,7 @@ async def process_single_image(s3_image_url: str) -> ImageQRResult:
             image_url=image_signed_url,
             image_coordinates=image_coordinates,
             qr_results=qr_results,
+            real_world_coordinates=real_world_coordinates,
             success=True
         )
         
