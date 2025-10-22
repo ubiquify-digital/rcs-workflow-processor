@@ -782,9 +782,46 @@ def get_latest_folder_map(folder_filter: Optional[List[str]] = None) -> Optional
         if not folder_result.data:
             return None
         
-        # Sort by folder name to get the most recent drone run chronologically
-        # Folder names like "Run September 22 6:07 PM" sort correctly as strings
-        folders = sorted(folder_result.data, key=lambda x: x["folder_name"], reverse=True)
+        # Sort by folder name datetime to get the most recent drone run chronologically
+        def extract_datetime_from_folder_name(folder_record):
+            """Extract datetime from folder name like 'Run September 29 5:33 PM'"""
+            try:
+                import re
+                from datetime import datetime
+                
+                folder_name = folder_record["folder_name"]
+                # Parse folder name format: "Run September 29 5:33 PM"
+                match = re.match(r"Run (\w+) (\d+) (\d+):(\d+) (AM|PM)", folder_name)
+                if match:
+                    month_name, day, hour, minute, ampm = match.groups()
+                    
+                    # Convert month name to number
+                    month_map = {
+                        'January': 1, 'February': 2, 'March': 3, 'April': 4,
+                        'May': 5, 'June': 6, 'July': 7, 'August': 8,
+                        'September': 9, 'October': 10, 'November': 11, 'December': 12
+                    }
+                    month = month_map.get(month_name, 1)
+                    
+                    # Convert 12-hour to 24-hour format
+                    hour = int(hour)
+                    if ampm == 'PM' and hour != 12:
+                        hour += 12
+                    elif ampm == 'AM' and hour == 12:
+                        hour = 0
+                    
+                    # Create datetime object (assuming current year)
+                    current_year = datetime.now().year
+                    return datetime(current_year, month, int(day), hour, int(minute))
+                
+                # Fallback to created_at if parsing fails
+                return datetime.fromisoformat(folder_record.get("created_at", "1970-01-01T00:00:00").replace('Z', '+00:00'))
+            except:
+                # Fallback to created_at if parsing fails
+                return datetime.fromisoformat(folder_record.get("created_at", "1970-01-01T00:00:00").replace('Z', '+00:00'))
+        
+        # Sort by extracted datetime from folder name (most recent first)
+        folders = sorted(folder_result.data, key=extract_datetime_from_folder_name, reverse=True)
         latest_folder = folders[0]
         
         # Get all images from this folder with VINs
