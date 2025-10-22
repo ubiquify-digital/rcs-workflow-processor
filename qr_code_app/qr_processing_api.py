@@ -17,6 +17,7 @@ import base64
 import io
 import subprocess
 import json
+import math
 from PIL import Image
 from PIL.ExifTags import TAGS, GPSTAGS
 import cv2
@@ -31,6 +32,8 @@ from io import BytesIO
 import openai
 from collections import defaultdict
 import math
+import exifread
+from pyproj import Geod
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -383,6 +386,50 @@ def extract_gps_from_image(s3_url: str) -> Optional[Dict[str, float]]:
     except Exception as e:
         logger.warning(f"Could not extract GPS data: {str(e)}")
         return None
+
+def estimate_object_gps(
+    center_lat: float,
+    center_lon: float,
+    altitude_m: float,
+    focal_length_mm: float,
+    sensor_width_mm: float,
+    image_width_px: int,
+    bbox_center_px: tuple[int, int],
+    image_size_px: tuple[int, int]
+):
+    """
+    Estimate object GPS coordinates from a single aerial image and its EXIF metadata.
+
+    Args:
+        center_lat, center_lon: image GPS center
+        altitude_m: drone altitude in meters
+        focal_length_mm: camera focal length (mm)
+        sensor_width_mm: camera sensor width (mm)
+        image_width_px: image width (px)
+        bbox_center_px: (x, y) pixel coordinate of detected object
+        image_size_px: (width, height) of image (px)
+
+    Returns:
+        (lat, lon): estimated GPS coordinate of object
+    """
+
+    # Ground width visible in image at current altitude
+    ground_width_m = altitude_m * (sensor_width_mm / focal_length_mm)
+    meters_per_px = ground_width_m / image_width_px
+
+    # Pixel offset from center (x → east, y → south)
+    dx_px = bbox_center_px[0] - (image_size_px[0] / 2)
+    dy_px = bbox_center_px[1] - (image_size_px[1] / 2)
+    dx_m = dx_px * meters_per_px
+    dy_m = dy_px * meters_per_px
+
+    # Convert local offsets to lat/lon
+    geod = Geod(ellps="WGS84")
+    lon_east, lat_east, _ = geod.fwd(center_lon, center_lat, 90, dx_m)
+    lon_final, lat_final, _ = geod.fwd(lon_east, lat_east, 180, dy_m)
+
+    return lat_final, lon_final
+
 
 def convert_to_degrees(value):
     """Convert GPS coordinates from degrees/minutes/seconds to decimal degrees"""
@@ -1459,6 +1506,291 @@ def update_folder_record(task_id: str, **updates) -> bool:
         logger.error(f"Error updating folder record: {str(e)}")
         return False
 
+def read_exif_basic(path, debug=False):
+    """
+    Simple function to extract all EXIF tags as listed by the user.
+    """
+    with open(path,'rb') as f:
+        tags = exifread.process_file(f)
+    
+    def _deg(vals):
+        d = float(vals[0].num)/vals[0].den
+        m = float(vals[1].num)/vals[1].den
+        s = float(vals[2].num)/vals[2].den
+        return d + m/60.0 + s/3600.0
+    
+    # Basic GPS coordinates
+    lat = lon = alt = heading = None
+    if "GPS GPSLatitude" in tags:
+        lat = _deg(tags["GPS GPSLatitude"].values)
+        if tags.get("GPS GPSLatitudeRef", "N").printable != 'N': lat = -lat
+    if "GPS GPSLongitude" in tags:
+        lon = _deg(tags["GPS GPSLongitude"].values)
+        if tags.get("GPS GPSLongitudeRef", "E").printable != 'E': lon = -lon
+    if "GPS GPSAltitude" in tags:
+        a = tags["GPS GPSAltitude"].values[0]
+        alt = float(a.num)/float(a.den)
+    if "GPS GPSImgDirection" in tags:
+        d = tags["GPS GPSImgDirection"].values[0]
+        heading = float(d.num)/float(d.den)
+    
+    # Extract all the tags as listed by the user
+    realworld_data = {}
+    
+    # Basic file info
+    realworld_data['filename'] = tags.get("EXIF FileName", {}).printable if "EXIF FileName" in tags and hasattr(tags["EXIF FileName"], 'printable') else None
+    realworld_data['filesize'] = tags.get("EXIF FileSize", {}).printable if "EXIF FileSize" in tags and hasattr(tags["EXIF FileSize"], 'printable') else None
+    realworld_data['filemodifydate'] = tags.get("EXIF FileModifyDate", {}).printable if "EXIF FileModifyDate" in tags and hasattr(tags["EXIF FileModifyDate"], 'printable') else None
+    realworld_data['fileaccessdate'] = tags.get("EXIF FileAccessDate", {}).printable if "EXIF FileAccessDate" in tags and hasattr(tags["EXIF FileAccessDate"], 'printable') else None
+    realworld_data['fileinodechangedate'] = tags.get("EXIF FileInodeChangeDate", {}).printable if "EXIF FileInodeChangeDate" in tags and hasattr(tags["EXIF FileInodeChangeDate"], 'printable') else None
+    realworld_data['filepermissions'] = tags.get("EXIF FilePermissions", {}).printable if "EXIF FilePermissions" in tags and hasattr(tags["EXIF FilePermissions"], 'printable') else None
+    realworld_data['filetype'] = tags.get("EXIF FileType", {}).printable if "EXIF FileType" in tags and hasattr(tags["EXIF FileType"], 'printable') else None
+    realworld_data['filetypeextension'] = tags.get("EXIF FileTypeExtension", {}).printable if "EXIF FileTypeExtension" in tags and hasattr(tags["EXIF FileTypeExtension"], 'printable') else None
+    realworld_data['mimetype'] = tags.get("EXIF MIMEType", {}).printable if "EXIF MIMEType" in tags and hasattr(tags["EXIF MIMEType"], 'printable') else None
+    realworld_data['exifbyteorder'] = tags.get("EXIF ExifByteOrder", {}).printable if "EXIF ExifByteOrder" in tags and hasattr(tags["EXIF ExifByteOrder"], 'printable') else None
+    realworld_data['imagewidth'] = tags.get("EXIF ImageWidth", {}).printable if "EXIF ImageWidth" in tags and hasattr(tags["EXIF ImageWidth"], 'printable') else None
+    realworld_data['imageheight'] = tags.get("EXIF ImageHeight", {}).printable if "EXIF ImageHeight" in tags and hasattr(tags["EXIF ImageHeight"], 'printable') else None
+    realworld_data['encodingprocess'] = tags.get("EXIF EncodingProcess", {}).printable if "EXIF EncodingProcess" in tags and hasattr(tags["EXIF EncodingProcess"], 'printable') else None
+    realworld_data['bitspersample'] = tags.get("EXIF BitsPerSample", {}).printable if "EXIF BitsPerSample" in tags and hasattr(tags["EXIF BitsPerSample"], 'printable') else None
+    realworld_data['colorcomponents'] = tags.get("EXIF ColorComponents", {}).printable if "EXIF ColorComponents" in tags and hasattr(tags["EXIF ColorComponents"], 'printable') else None
+    realworld_data['ycbcrsubsampling'] = tags.get("EXIF YCbCrSubSampling", {}).printable if "EXIF YCbCrSubSampling" in tags and hasattr(tags["EXIF YCbCrSubSampling"], 'printable') else None
+    realworld_data['imagedescription'] = tags.get("EXIF ImageDescription", {}).printable if "EXIF ImageDescription" in tags and hasattr(tags["EXIF ImageDescription"], 'printable') else None
+    realworld_data['make'] = tags.get("Image Make", {}).printable if "Image Make" in tags and hasattr(tags["Image Make"], 'printable') else None
+    realworld_data['model'] = tags.get("Image Model", {}).printable if "Image Model" in tags and hasattr(tags["Image Model"], 'printable') else None
+    realworld_data['orientation'] = tags.get("Image Orientation", {}).printable if "Image Orientation" in tags and hasattr(tags["Image Orientation"], 'printable') else None
+    realworld_data['xresolution'] = tags.get("EXIF XResolution", {}).printable if "EXIF XResolution" in tags and hasattr(tags["EXIF XResolution"], 'printable') else None
+    realworld_data['yresolution'] = tags.get("EXIF YResolution", {}).printable if "EXIF YResolution" in tags and hasattr(tags["EXIF YResolution"], 'printable') else None
+    realworld_data['resolutionunit'] = tags.get("EXIF ResolutionUnit", {}).printable if "EXIF ResolutionUnit" in tags and hasattr(tags["EXIF ResolutionUnit"], 'printable') else None
+    realworld_data['software'] = tags.get("Image Software", {}).printable if "Image Software" in tags and hasattr(tags["Image Software"], 'printable') else None
+    realworld_data['modifydate'] = tags.get("EXIF ModifyDate", {}).printable if "EXIF ModifyDate" in tags and hasattr(tags["EXIF ModifyDate"], 'printable') else None
+    realworld_data['ycbcrpositioning'] = tags.get("EXIF YCbCrPositioning", {}).printable if "EXIF YCbCrPositioning" in tags and hasattr(tags["EXIF YCbCrPositioning"], 'printable') else None
+    realworld_data['exposuretime'] = tags.get("EXIF ExposureTime", {}).printable if "EXIF ExposureTime" in tags and hasattr(tags["EXIF ExposureTime"], 'printable') else None
+    realworld_data['fnumber'] = tags.get("EXIF FNumber", {}).printable if "EXIF FNumber" in tags and hasattr(tags["EXIF FNumber"], 'printable') else None
+    realworld_data['exposureprogram'] = tags.get("EXIF ExposureProgram", {}).printable if "EXIF ExposureProgram" in tags and hasattr(tags["EXIF ExposureProgram"], 'printable') else None
+    realworld_data['iso'] = tags.get("EXIF ISOSpeedRatings", {}).printable if "EXIF ISOSpeedRatings" in tags and hasattr(tags["EXIF ISOSpeedRatings"], 'printable') else None
+    realworld_data['sensitivitytype'] = tags.get("EXIF SensitivityType", {}).printable if "EXIF SensitivityType" in tags and hasattr(tags["EXIF SensitivityType"], 'printable') else None
+    realworld_data['exifversion'] = tags.get("EXIF ExifVersion", {}).printable if "EXIF ExifVersion" in tags and hasattr(tags["EXIF ExifVersion"], 'printable') else None
+    realworld_data['datetimeoriginal'] = tags.get("EXIF DateTimeOriginal", {}).printable if "EXIF DateTimeOriginal" in tags and hasattr(tags["EXIF DateTimeOriginal"], 'printable') else None
+    realworld_data['createdate'] = tags.get("EXIF CreateDate", {}).printable if "EXIF CreateDate" in tags and hasattr(tags["EXIF CreateDate"], 'printable') else None
+    realworld_data['componentsconfiguration'] = tags.get("EXIF ComponentsConfiguration", {}).printable if "EXIF ComponentsConfiguration" in tags and hasattr(tags["EXIF ComponentsConfiguration"], 'printable') else None
+    realworld_data['shutterspeedvalue'] = tags.get("EXIF ShutterSpeedValue", {}).printable if "EXIF ShutterSpeedValue" in tags and hasattr(tags["EXIF ShutterSpeedValue"], 'printable') else None
+    realworld_data['aperturevalue'] = tags.get("EXIF ApertureValue", {}).printable if "EXIF ApertureValue" in tags and hasattr(tags["EXIF ApertureValue"], 'printable') else None
+    realworld_data['exposurecompensation'] = tags.get("EXIF ExposureBiasValue", {}).printable if "EXIF ExposureBiasValue" in tags and hasattr(tags["EXIF ExposureBiasValue"], 'printable') else None
+    realworld_data['maxaperturevalue'] = tags.get("EXIF MaxApertureValue", {}).printable if "EXIF MaxApertureValue" in tags and hasattr(tags["EXIF MaxApertureValue"], 'printable') else None
+    realworld_data['subjectdistance'] = tags.get("EXIF SubjectDistance", {}).printable if "EXIF SubjectDistance" in tags and hasattr(tags["EXIF SubjectDistance"], 'printable') else None
+    realworld_data['meteringmode'] = tags.get("EXIF MeteringMode", {}).printable if "EXIF MeteringMode" in tags and hasattr(tags["EXIF MeteringMode"], 'printable') else None
+    realworld_data['lightsource'] = tags.get("EXIF LightSource", {}).printable if "EXIF LightSource" in tags and hasattr(tags["EXIF LightSource"], 'printable') else None
+    realworld_data['flash'] = tags.get("EXIF Flash", {}).printable if "EXIF Flash" in tags and hasattr(tags["EXIF Flash"], 'printable') else None
+    realworld_data['focallength'] = tags.get("EXIF FocalLength", {}).printable if "EXIF FocalLength" in tags and hasattr(tags["EXIF FocalLength"], 'printable') else None
+    realworld_data['flashpixversion'] = tags.get("EXIF FlashpixVersion", {}).printable if "EXIF FlashpixVersion" in tags and hasattr(tags["EXIF FlashpixVersion"], 'printable') else None
+    realworld_data['colorspace'] = tags.get("EXIF ColorSpace", {}).printable if "EXIF ColorSpace" in tags and hasattr(tags["EXIF ColorSpace"], 'printable') else None
+    realworld_data['exifimagewidth'] = tags.get("EXIF ExifImageWidth", {}).printable if "EXIF ExifImageWidth" in tags and hasattr(tags["EXIF ExifImageWidth"], 'printable') else None
+    realworld_data['exifimageheight'] = tags.get("EXIF ExifImageHeight", {}).printable if "EXIF ExifImageHeight" in tags and hasattr(tags["EXIF ExifImageHeight"], 'printable') else None
+    realworld_data['interopindex'] = tags.get("EXIF InteropIndex", {}).printable if "EXIF InteropIndex" in tags and hasattr(tags["EXIF InteropIndex"], 'printable') else None
+    realworld_data['interopversion'] = tags.get("EXIF InteropVersion", {}).printable if "EXIF InteropVersion" in tags and hasattr(tags["EXIF InteropVersion"], 'printable') else None
+    realworld_data['filesource'] = tags.get("EXIF FileSource", {}).printable if "EXIF FileSource" in tags and hasattr(tags["EXIF FileSource"], 'printable') else None
+    realworld_data['scenetype'] = tags.get("EXIF SceneType", {}).printable if "EXIF SceneType" in tags and hasattr(tags["EXIF SceneType"], 'printable') else None
+    realworld_data['customrendered'] = tags.get("EXIF CustomRendered", {}).printable if "EXIF CustomRendered" in tags and hasattr(tags["EXIF CustomRendered"], 'printable') else None
+    realworld_data['exposuremode'] = tags.get("EXIF ExposureMode", {}).printable if "EXIF ExposureMode" in tags and hasattr(tags["EXIF ExposureMode"], 'printable') else None
+    realworld_data['whitebalance'] = tags.get("EXIF WhiteBalance", {}).printable if "EXIF WhiteBalance" in tags and hasattr(tags["EXIF WhiteBalance"], 'printable') else None
+    realworld_data['digitalzoomratio'] = tags.get("EXIF DigitalZoomRatio", {}).printable if "EXIF DigitalZoomRatio" in tags and hasattr(tags["EXIF DigitalZoomRatio"], 'printable') else None
+    realworld_data['focallengthin35mmformat'] = tags.get("EXIF FocalLengthIn35mmFilm", {}).printable if "EXIF FocalLengthIn35mmFilm" in tags and hasattr(tags["EXIF FocalLengthIn35mmFilm"], 'printable') else None
+    realworld_data['scenecapturetype'] = tags.get("EXIF SceneCaptureType", {}).printable if "EXIF SceneCaptureType" in tags and hasattr(tags["EXIF SceneCaptureType"], 'printable') else None
+    realworld_data['gaincontrol'] = tags.get("EXIF GainControl", {}).printable if "EXIF GainControl" in tags and hasattr(tags["EXIF GainControl"], 'printable') else None
+    realworld_data['contrast'] = tags.get("EXIF Contrast", {}).printable if "EXIF Contrast" in tags and hasattr(tags["EXIF Contrast"], 'printable') else None
+    realworld_data['saturation'] = tags.get("EXIF Saturation", {}).printable if "EXIF Saturation" in tags and hasattr(tags["EXIF Saturation"], 'printable') else None
+    realworld_data['sharpness'] = tags.get("EXIF Sharpness", {}).printable if "EXIF Sharpness" in tags and hasattr(tags["EXIF Sharpness"], 'printable') else None
+    realworld_data['devicesettingdescription'] = tags.get("EXIF DeviceSettingDescription", {}).printable if "EXIF DeviceSettingDescription" in tags and hasattr(tags["EXIF DeviceSettingDescription"], 'printable') else None
+    realworld_data['serialnumber'] = tags.get("EXIF SerialNumber", {}).printable if "EXIF SerialNumber" in tags and hasattr(tags["EXIF SerialNumber"], 'printable') else None
+    realworld_data['lensinfo'] = tags.get("EXIF LensInfo", {}).printable if "EXIF LensInfo" in tags and hasattr(tags["EXIF LensInfo"], 'printable') else None
+    realworld_data['uniquecameramodel'] = tags.get("EXIF UniqueCameraModel", {}).printable if "EXIF UniqueCameraModel" in tags and hasattr(tags["EXIF UniqueCameraModel"], 'printable') else None
+    realworld_data['gpsversionid'] = tags.get("GPS GPSVersionID", {}).printable if "GPS GPSVersionID" in tags and hasattr(tags["GPS GPSVersionID"], 'printable') else None
+    realworld_data['gpslatituderef'] = tags.get("GPS GPSLatitudeRef", {}).printable if "GPS GPSLatitudeRef" in tags and hasattr(tags["GPS GPSLatitudeRef"], 'printable') else None
+    realworld_data['gpslatitude'] = tags.get("GPS GPSLatitude", {}).printable if "GPS GPSLatitude" in tags and hasattr(tags["GPS GPSLatitude"], 'printable') else None
+    realworld_data['gpslongituderef'] = tags.get("GPS GPSLongitudeRef", {}).printable if "GPS GPSLongitudeRef" in tags and hasattr(tags["GPS GPSLongitudeRef"], 'printable') else None
+    realworld_data['gpslongitude'] = tags.get("GPS GPSLongitude", {}).printable if "GPS GPSLongitude" in tags and hasattr(tags["GPS GPSLongitude"], 'printable') else None
+    realworld_data['gpsaltituderef'] = tags.get("GPS GPSAltitudeRef", {}).printable if "GPS GPSAltitudeRef" in tags and hasattr(tags["GPS GPSAltitudeRef"], 'printable') else None
+    realworld_data['gpsaltitude'] = tags.get("GPS GPSAltitude", {}).printable if "GPS GPSAltitude" in tags and hasattr(tags["GPS GPSAltitude"], 'printable') else None
+    realworld_data['gpsstatus'] = tags.get("GPS GPSStatus", {}).printable if "GPS GPSStatus" in tags and hasattr(tags["GPS GPSStatus"], 'printable') else None
+    realworld_data['gpsmapdatum'] = tags.get("GPS GPSMapDatum", {}).printable if "GPS GPSMapDatum" in tags and hasattr(tags["GPS GPSMapDatum"], 'printable') else None
+    realworld_data['xpcomment'] = tags.get("EXIF XPComment", {}).printable if "EXIF XPComment" in tags and hasattr(tags["EXIF XPComment"], 'printable') else None
+    realworld_data['xpkeywords'] = tags.get("EXIF XPKeywords", {}).printable if "EXIF XPKeywords" in tags and hasattr(tags["EXIF XPKeywords"], 'printable') else None
+    realworld_data['compression'] = tags.get("EXIF Compression", {}).printable if "EXIF Compression" in tags and hasattr(tags["EXIF Compression"], 'printable') else None
+    realworld_data['thumbnailoffset'] = tags.get("EXIF ThumbnailOffset", {}).printable if "EXIF ThumbnailOffset" in tags and hasattr(tags["EXIF ThumbnailOffset"], 'printable') else None
+    realworld_data['thumbnaillength'] = tags.get("EXIF ThumbnailLength", {}).printable if "EXIF ThumbnailLength" in tags and hasattr(tags["EXIF ThumbnailLength"], 'printable') else None
+    realworld_data['about'] = tags.get("EXIF About", {}).printable if "EXIF About" in tags and hasattr(tags["EXIF About"], 'printable') else None
+    realworld_data['format'] = tags.get("EXIF Format", {}).printable if "EXIF Format" in tags and hasattr(tags["EXIF Format"], 'printable') else None
+    realworld_data['imagesource'] = tags.get("EXIF ImageSource", {}).printable if "EXIF ImageSource" in tags and hasattr(tags["EXIF ImageSource"], 'printable') else None
+    realworld_data['gpsstatus_rtk'] = tags.get("EXIF GpsStatus", {}).printable if "EXIF GpsStatus" in tags and hasattr(tags["EXIF GpsStatus"], 'printable') else None
+    realworld_data['altitudetype'] = tags.get("EXIF AltitudeType", {}).printable if "EXIF AltitudeType" in tags and hasattr(tags["EXIF AltitudeType"], 'printable') else None
+    realworld_data['absolutealtitude'] = tags.get("EXIF AbsoluteAltitude", {}).printable if "EXIF AbsoluteAltitude" in tags and hasattr(tags["EXIF AbsoluteAltitude"], 'printable') else None
+    realworld_data['relativealtitude'] = tags.get("EXIF RelativeAltitude", {}).printable if "EXIF RelativeAltitude" in tags and hasattr(tags["EXIF RelativeAltitude"], 'printable') else None
+    realworld_data['gimbalrolldegree'] = tags.get("EXIF GimbalRollDegree", {}).printable if "EXIF GimbalRollDegree" in tags and hasattr(tags["EXIF GimbalRollDegree"], 'printable') else None
+    realworld_data['gimbalyawdegree'] = tags.get("EXIF GimbalYawDegree", {}).printable if "EXIF GimbalYawDegree" in tags and hasattr(tags["EXIF GimbalYawDegree"], 'printable') else None
+    realworld_data['gimbalpitchdegree'] = tags.get("EXIF GimbalPitchDegree", {}).printable if "EXIF GimbalPitchDegree" in tags and hasattr(tags["EXIF GimbalPitchDegree"], 'printable') else None
+    realworld_data['flightrolldegree'] = tags.get("EXIF FlightRollDegree", {}).printable if "EXIF FlightRollDegree" in tags and hasattr(tags["EXIF FlightRollDegree"], 'printable') else None
+    realworld_data['flightyawdegree'] = tags.get("EXIF FlightYawDegree", {}).printable if "EXIF FlightYawDegree" in tags and hasattr(tags["EXIF FlightYawDegree"], 'printable') else None
+    realworld_data['flightpitchdegree'] = tags.get("EXIF FlightPitchDegree", {}).printable if "EXIF FlightPitchDegree" in tags and hasattr(tags["EXIF FlightPitchDegree"], 'printable') else None
+    realworld_data['flightxspeed'] = tags.get("EXIF FlightXSpeed", {}).printable if "EXIF FlightXSpeed" in tags and hasattr(tags["EXIF FlightXSpeed"], 'printable') else None
+    realworld_data['flightyspeed'] = tags.get("EXIF FlightYSpeed", {}).printable if "EXIF FlightYSpeed" in tags and hasattr(tags["EXIF FlightYSpeed"], 'printable') else None
+    realworld_data['flightzspeed'] = tags.get("EXIF FlightZSpeed", {}).printable if "EXIF FlightZSpeed" in tags and hasattr(tags["EXIF FlightZSpeed"], 'printable') else None
+    realworld_data['camreverse'] = tags.get("EXIF CamReverse", {}).printable if "EXIF CamReverse" in tags and hasattr(tags["EXIF CamReverse"], 'printable') else None
+    realworld_data['gimbalreverse'] = tags.get("EXIF GimbalReverse", {}).printable if "EXIF GimbalReverse" in tags and hasattr(tags["EXIF GimbalReverse"], 'printable') else None
+    realworld_data['sensortemperature'] = tags.get("EXIF SensorTemperature", {}).printable if "EXIF SensorTemperature" in tags and hasattr(tags["EXIF SensorTemperature"], 'printable') else None
+    realworld_data['productname'] = tags.get("EXIF ProductName", {}).printable if "EXIF ProductName" in tags and hasattr(tags["EXIF ProductName"], 'printable') else None
+    realworld_data['selfdata'] = tags.get("EXIF SelfData", {}).printable if "EXIF SelfData" in tags and hasattr(tags["EXIF SelfData"], 'printable') else None
+    realworld_data['surveyingmode'] = tags.get("EXIF SurveyingMode", {}).printable if "EXIF SurveyingMode" in tags and hasattr(tags["EXIF SurveyingMode"], 'printable') else None
+    realworld_data['shuttertype'] = tags.get("EXIF ShutterType", {}).printable if "EXIF ShutterType" in tags and hasattr(tags["EXIF ShutterType"], 'printable') else None
+    realworld_data['cameraserialnumber'] = tags.get("EXIF CameraSerialNumber", {}).printable if "EXIF CameraSerialNumber" in tags and hasattr(tags["EXIF CameraSerialNumber"], 'printable') else None
+    realworld_data['dronemodel'] = tags.get("EXIF DroneModel", {}).printable if "EXIF DroneModel" in tags and hasattr(tags["EXIF DroneModel"], 'printable') else None
+    realworld_data['droneserialnumber'] = tags.get("EXIF DroneSerialNumber", {}).printable if "EXIF DroneSerialNumber" in tags and hasattr(tags["EXIF DroneSerialNumber"], 'printable') else None
+    realworld_data['whitebalancecct'] = tags.get("EXIF WhiteBalanceCCT", {}).printable if "EXIF WhiteBalanceCCT" in tags and hasattr(tags["EXIF WhiteBalanceCCT"], 'printable') else None
+    realworld_data['sensorfps'] = tags.get("EXIF SensorFPS", {}).printable if "EXIF SensorFPS" in tags and hasattr(tags["EXIF SensorFPS"], 'printable') else None
+    realworld_data['version'] = tags.get("EXIF Version", {}).printable if "EXIF Version" in tags and hasattr(tags["EXIF Version"], 'printable') else None
+    realworld_data['hassettings'] = tags.get("EXIF HasSettings", {}).printable if "EXIF HasSettings" in tags and hasattr(tags["EXIF HasSettings"], 'printable') else None
+    realworld_data['hascrop'] = tags.get("EXIF HasCrop", {}).printable if "EXIF HasCrop" in tags and hasattr(tags["EXIF HasCrop"], 'printable') else None
+    realworld_data['alreadyapplied'] = tags.get("EXIF AlreadyApplied", {}).printable if "EXIF AlreadyApplied" in tags and hasattr(tags["EXIF AlreadyApplied"], 'printable') else None
+    realworld_data['totalframes'] = tags.get("EXIF TotalFrames", {}).printable if "EXIF TotalFrames" in tags and hasattr(tags["EXIF TotalFrames"], 'printable') else None
+    realworld_data['sensorid'] = tags.get("EXIF SensorID", {}).printable if "EXIF SensorID" in tags and hasattr(tags["EXIF SensorID"], 'printable') else None
+    realworld_data['scalefactor35efl'] = tags.get("EXIF ScaleFactor35efl", {}).printable if "EXIF ScaleFactor35efl" in tags and hasattr(tags["EXIF ScaleFactor35efl"], 'printable') else None
+    realworld_data['shutterspeed'] = tags.get("EXIF ShutterSpeed", {}).printable if "EXIF ShutterSpeed" in tags and hasattr(tags["EXIF ShutterSpeed"], 'printable') else None
+    realworld_data['circleofconfusion'] = tags.get("EXIF CircleOfConfusion", {}).printable if "EXIF CircleOfConfusion" in tags and hasattr(tags["EXIF CircleOfConfusion"], 'printable') else None
+    realworld_data['fov'] = tags.get("EXIF FOV", {}).printable if "EXIF FOV" in tags and hasattr(tags["EXIF FOV"], 'printable') else None
+    realworld_data['focallength35efl'] = tags.get("EXIF FocalLength35efl", {}).printable if "EXIF FocalLength35efl" in tags and hasattr(tags["EXIF FocalLength35efl"], 'printable') else None
+    realworld_data['gpsposition'] = tags.get("EXIF GPSPosition", {}).printable if "EXIF GPSPosition" in tags and hasattr(tags["EXIF GPSPosition"], 'printable') else None
+    realworld_data['hyperfocaldistance'] = tags.get("EXIF HyperfocalDistance", {}).printable if "EXIF HyperfocalDistance" in tags and hasattr(tags["EXIF HyperfocalDistance"], 'printable') else None
+    realworld_data['lightvalue'] = tags.get("EXIF LightValue", {}).printable if "EXIF LightValue" in tags and hasattr(tags["EXIF LightValue"], 'printable') else None
+    
+    # Print the extracted data
+    print("EXTRACTED EXIF DATA:")
+    for key, value in realworld_data.items():
+        if value is not None:
+            print(f"  {key}: {value}")
+    
+    return lat, lon, alt, heading, realworld_data
+
+
+def get_realworld_coordinates(s3_image_url: str) -> Dict[str, float]:
+    """Get realworld coordinates from image coordinates"""
+    try:
+        # Download image from S3 locally for processing
+        import os
+        
+        # Parse S3 URL
+        if s3_image_url.startswith('s3://'):
+            # Extract bucket and key from s3://bucket/key format
+            s3_path = s3_image_url[5:]  # Remove 's3://'
+            bucket, key = s3_path.split('/', 1)
+            
+            # Download from S3
+            s3_client = boto3.client('s3')
+            local_image_path = "temp_image.jpg"
+            s3_client.download_file(bucket, key, local_image_path)
+        else:
+            # Handle regular HTTP URLs
+            import requests
+            response = requests.get(s3_image_url)
+            local_image_path = "temp_image.jpg"
+            with open(local_image_path, 'wb') as f:
+                f.write(response.content)
+        
+        # Extract EXIF data
+        lat, lon, alt, heading, realworld_data = read_exif_basic(local_image_path)
+        
+        if lat is None or lon is None or alt is None:
+            logger.error("Missing GPS data in EXIF")
+            return None
+        
+        # Run Roboflow workflow
+        roboflow_client = get_roboflow_client()
+        result = roboflow_client.run_workflow(
+            workspace_name=ROBOFLOW_WORKSPACE,
+            workflow_id=QR_WORKFLOW_ID,
+            images={"image": local_image_path}
+        )
+        
+        # Debug: Print the result structure
+        import json
+        print("DEBUG: Roboflow result structure:")
+        print(json.dumps(result, indent=2, default=str))
+        
+        # Handle the array structure - result is wrapped in an array
+        if isinstance(result, list) and len(result) > 0:
+            result = result[0]
+        
+        # Extract predictions and find highest confidence
+        if 'model_predictions' in result and 'predictions' in result['model_predictions']:
+            predictions = result['model_predictions']['predictions']
+            if predictions:
+                # Find prediction with highest confidence
+                best_prediction = max(predictions, key=lambda p: p['confidence'])
+                
+                # Get bbox center coordinates
+                bbox_center_x = best_prediction['x']
+                bbox_center_y = best_prediction['y']
+                
+                # Get image dimensions
+                image_width = result['model_predictions']['image']['width']
+                image_height = result['model_predictions']['image']['height']
+                
+                # Extract focal length from EXIF data
+                focal_length_mm = None
+                if realworld_data.get('focallength'):
+                    try:
+                        # Handle fraction format like "168/25"
+                        if '/' in str(realworld_data['focallength']):
+                            num, den = str(realworld_data['focallength']).split('/')
+                            focal_length_mm = float(num) / float(den)
+                        else:
+                            focal_length_mm = float(realworld_data['focallength'])
+                    except:
+                        pass
+                
+                if focal_length_mm is None:
+                    logger.error("Could not extract focal length from EXIF")
+                    return None
+                
+                # Estimate object GPS coordinates
+                object_lat, object_lon = estimate_object_gps(
+                    center_lat=lat,
+                    center_lon=lon,
+                    altitude_m=alt,
+                    focal_length_mm=focal_length_mm,
+                    sensor_width_mm=36.0,  # Standard 35mm sensor width
+                    image_width_px=image_width,
+                    bbox_center_px=(bbox_center_x, bbox_center_y),
+                    image_size_px=(image_width, image_height)
+                )
+                
+                # Clean up temporary file
+                os.remove(local_image_path)
+                
+                return {
+                    'latitude': object_lat,
+                    'longitude': object_lon,
+                    'object_lat': object_lat,
+                    'object_lon': object_lon,
+                    'image_lat': lat,
+                    'image_lon': lon,
+                    'altitude': alt,
+                    'detected_class': best_prediction['class'],
+                    'confidence': best_prediction['confidence']
+                }
+            else:
+                logger.error("No predictions found in Roboflow result")
+                return None
+        else:
+            logger.error("Invalid Roboflow result format")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error getting realworld coordinates: {str(e)}")
+        return None
+    finally:
+        # Clean up temporary file if it exists
+        if 'local_image_path' in locals() and os.path.exists(local_image_path):
+            os.remove(local_image_path)
+
 def store_image_result(task_id: str, s3_image_url: str, image_result: ImageQRResult) -> bool:
     """Store individual image processing result in database"""
     if not supabase:
@@ -1473,6 +1805,8 @@ def store_image_result(task_id: str, s3_image_url: str, image_result: ImageQRRes
             }
             for qr in image_result.qr_results
         ]
+
+        realworld_coordinates = get_realworld_coordinates(s3_image_url)
         
         supabase.table('qr_processed_images').insert({
             'task_id': task_id,
@@ -1480,8 +1814,8 @@ def store_image_result(task_id: str, s3_image_url: str, image_result: ImageQRRes
             's3_input_url': s3_image_url,
             'image_signed_url': image_result.image_url,
             'timestamp': datetime.now().isoformat(),
-            'latitude': image_result.image_coordinates.get('latitude') if image_result.image_coordinates else None,
-            'longitude': image_result.image_coordinates.get('longitude') if image_result.image_coordinates else None,
+            'latitude': realworld_coordinates.get('latitude') if realworld_coordinates else None,
+            'longitude': realworld_coordinates.get('longitude') if realworld_coordinates else None,
             'qr_results': qr_results_json,
             'processing_status': 'success' if image_result.success else 'failed',
             'error_message': image_result.error,
