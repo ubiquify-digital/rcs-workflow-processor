@@ -391,9 +391,10 @@ def convert_to_degrees(value):
         return float(d) + float(m)/60 + float(s)/3600
     return 0.0
 
-def decode_qr_from_base64(base64_string: str) -> Optional[str]:
+def decode_qr_from_base64(base64_string: str) -> List[str]:
     """Decode AprilTag (tagStandard52h13) from a base64 image using external detector binary.
-    Writes a temporary PGM to match detector stability."""
+    Writes a temporary PGM to match detector stability.
+    Returns a list of all detected tag IDs."""
     try:
         # Strip data URL prefix if present
         if base64_string.startswith('data:'):
@@ -421,10 +422,10 @@ def decode_qr_from_base64(base64_string: str) -> Optional[str]:
                     break
             dets = json.loads(json_text)
             if not dets:
-                return None
+                return []
 
-            # Return first tag id as string
-            return str(dets[0].get("id"))
+            # Return all tag IDs as strings
+            return [str(det.get("id")) for det in dets if det.get("id") is not None]
         finally:
             try:
                 os.unlink(tmp_path)
@@ -432,7 +433,7 @@ def decode_qr_from_base64(base64_string: str) -> Optional[str]:
                 pass
     except Exception as e:
         logger.warning(f"Could not decode AprilTag: {str(e)}")
-        return None
+        return []
 
 # AI VIN Description Generation
 def generate_vin_description(vin: str) -> str:
@@ -1530,12 +1531,27 @@ async def process_single_image(s3_image_url: str) -> ImageQRResult:
             
             logger.info(f"Found {len(crop_outputs)} QR code detections in {image_name}")
             
-            for i, crop_base64 in enumerate(crop_outputs):
-                qr_content = decode_qr_from_base64(crop_base64)
-                if qr_content:
-                    confidence = predictions[i].get('confidence', 0.0) if i < len(predictions) else 0.0
-                    qr_results.append(QRResult(content=qr_content, confidence=confidence))
-                    logger.info(f"✅ Decoded QR in {image_name}: {qr_content[:50]}...")
+            # Find the crop with the highest confidence
+            best_crop_index = 0
+            best_confidence = 0.0
+            
+            for i, pred in enumerate(predictions):
+                confidence = pred.get('confidence', 0.0)
+                if confidence > best_confidence:
+                    best_confidence = confidence
+                    best_crop_index = i
+            
+            logger.info(f"Processing crop {best_crop_index + 1} with highest confidence: {best_confidence:.3f}")
+            
+            # Process only the best crop
+            if best_crop_index < len(crop_outputs):
+                crop_base64 = crop_outputs[best_crop_index]
+                qr_contents = decode_qr_from_base64(crop_base64)
+                print(f"QR contents: {qr_contents}")
+                if qr_contents:
+                    for qr_content in qr_contents:
+                        qr_results.append(QRResult(content=qr_content, confidence=best_confidence))
+                        logger.info(f"✅ Decoded QR in {image_name}: {qr_content[:50]}...")
         
         # Generate signed URL for the image
         image_signed_url = get_s3_signed_url(s3_image_url)
