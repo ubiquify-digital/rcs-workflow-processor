@@ -1810,7 +1810,7 @@ def read_xmp_metadata(image_path: str) -> Dict[str, str]:
     return None
 
 
-def get_realworld_coordinates(s3_image_url: str) -> Dict[str, float]:
+def get_realworld_coordinates(s3_image_url: str) -> List[Dict[str, float]]:
     """Get realworld coordinates from image coordinates"""
     try:
         # Download image from S3 locally for processing
@@ -1881,6 +1881,7 @@ def get_realworld_coordinates(s3_image_url: str) -> Dict[str, float]:
                 
                 # Parse the JSON array
                 detections = json.loads(json_text)
+                logger.info(f"AprilTag detector found {len(detections)} detections in image")
             finally:
                 # Clean up temporary PGM file
                 import os
@@ -1889,22 +1890,15 @@ def get_realworld_coordinates(s3_image_url: str) -> Dict[str, float]:
             
         
             if detections:
-                # Use first detection
-                detection = detections[0]
+                # Process all detections
+                results = []
                 
-                # Get center coordinates from AprilTag detection
-                center = detection['center']
-                bbox_center_x = center['x']
-                bbox_center_y = center['y']
-                
-                # Get image dimensions from the image itself
+                # Get image dimensions from the image itself (same for all detections)
                 from PIL import Image
                 with Image.open(local_image_path) as img:
                     image_width, image_height = img.size
                 
-             
-                
-                # Extract focal length from EXIF data
+                # Extract focal length from EXIF data (same for all detections)
                 focal_length_mm = None
                 if realworld_data.get('focallength'):
                     try:
@@ -1921,14 +1915,9 @@ def get_realworld_coordinates(s3_image_url: str) -> Dict[str, float]:
                     logger.error("Could not extract focal length from EXIF")
                     return None
                 
-                # Calculate object position using simple offset from image center
-                # Image center coordinates (drone position)
+                # Image center coordinates (drone position) - same for all detections
                 image_center_x = image_width / 2
                 image_center_y = image_height / 2
-                
-                # Calculate offset from image center to AprilTag center
-                offset_x_px = bbox_center_x - image_center_x
-                offset_y_px = bbox_center_y - image_center_y
                 
                 # Convert pixel offset to meters using ground sample distance
                 # Use 35mm equivalent focal length for GSD calculation
@@ -1984,62 +1973,81 @@ def get_realworld_coordinates(s3_image_url: str) -> Dict[str, float]:
                     except:
                         gimbal_yaw_deg = 0.0
                 
-                print(f"DEBUG: Ground coverage: {W_m:.2f}m x {H_m:.2f}m")
-                print(f"DEBUG: Gimbal yaw: {gimbal_yaw_deg:.2f}°")
-                print(f"DEBUG: AprilTag center: ({bbox_center_x:.1f}, {bbox_center_y:.1f})")
-                
-                # Use the new pixel_to_latlon function
-                object_lat, object_lon = pixel_to_latlon(
-                    bbox_center_x, bbox_center_y,  # AprilTag center coordinates
-                    image_width, image_height,      # Image dimensions
-                    W_m, H_m,                      # Ground coverage in meters
-                    lat, lon,                      # Image center (drone position)
-                    gimbal_yaw_deg                 # Gimbal yaw angle
-                )
-                
-                # Debug output
-                print(f"DEBUG: === OBJECT POSITION CALCULATION ===")
-                print(f"DEBUG: {s3_image_url}")
-                print(f"Image dimensions: {image_width} x {image_height}")
-                print(f"Image center (drone position): {lat:.8f}, {lon:.8f}")
-                print(f"Bbox center: ({bbox_center_x}, {bbox_center_y})")
-                print(f"Offset from center: ({offset_x_px:.1f}px, {offset_y_px:.1f}px)")
-                print(f"Ground sample distance: {gsd:.6f} meters/pixel")
-                print(f"Object position: {object_lat:.8f}, {object_lon:.8f}")
-                print("DEBUG: AprilTag detections found:", len(detections))
-                print("DEBUG: AprilTag result structure:")
-                print(f"DEBUG: {json.dumps(detections, indent=2, default=str)}")    
-                print(f"DEBUG: AprilTag center: ({bbox_center_x}, {bbox_center_y})")
-                print(f"DEBUG: Image dimensions: {image_width} x {image_height}")
-                print(f"DEBUG: AprilTag ID: {detection.get('id', 'unknown')}")
-                print(f"DEBUG: Sensor width: {sensor_width_mm}mm")
-                print(f"DEBUG: Altitude: {alt:.2f}m (GPS units)")
-                print(f"DEBUG: Image width: {image_width}px")
-                print(f"DEBUG: Effective focal length: {effective_focal_length:.2f}mm")
-                print(f"DEBUG: GSD calculation: ({alt:.2f} * {sensor_width_mm}) / ({effective_focal_length:.2f} * {image_width}) = {gsd:.6f}")
-                print(f'DEBUG: Ground sample distance: {gsd:.6f} meters/pixel')
-                print(f"DEBUG: Digital zoom ratio: {digital_zoom_ratio:.2f}x")
-                print(f"DEBUG: 35mm focal length: {focal_length_35mm}mm")
-                print(f"DEBUG: **************************************************" )
+                # Process each detection
+                logger.info(f"Processing {len(detections)} AprilTag detections for coordinate calculation")
+                for detection in detections:
+                    # Get center coordinates from AprilTag detection
+                    center = detection['center']
+                    bbox_center_x = center['x']
+                    bbox_center_y = center['y']
+                    apriltag_id = detection.get('id', 'unknown')
+                    logger.info(f"Processing AprilTag ID {apriltag_id} at pixel coordinates ({bbox_center_x:.1f}, {bbox_center_y:.1f})")
+                    
+                    # Calculate offset from image center to AprilTag center
+                    offset_x_px = bbox_center_x - image_center_x
+                    offset_y_px = bbox_center_y - image_center_y
+                    
+                    print(f"DEBUG: Ground coverage: {W_m:.2f}m x {H_m:.2f}m")
+                    print(f"DEBUG: Gimbal yaw: {gimbal_yaw_deg:.2f}°")
+                    print(f"DEBUG: AprilTag center: ({bbox_center_x:.1f}, {bbox_center_y:.1f})")
+                    
+                    # Use the new pixel_to_latlon function
+                    object_lat, object_lon = pixel_to_latlon(
+                        bbox_center_x, bbox_center_y,  # AprilTag center coordinates
+                        image_width, image_height,      # Image dimensions
+                        W_m, H_m,                      # Ground coverage in meters
+                        lat, lon,                      # Image center (drone position)
+                        gimbal_yaw_deg                 # Gimbal yaw angle
+                    )
+                    
+                    # Debug output
+                    print(f"DEBUG: === OBJECT POSITION CALCULATION ===")
+                    print(f"DEBUG: {s3_image_url}")
+                    print(f"Image dimensions: {image_width} x {image_height}")
+                    print(f"Image center (drone position): {lat:.8f}, {lon:.8f}")
+                    print(f"Bbox center: ({bbox_center_x}, {bbox_center_y})")
+                    print(f"Offset from center: ({offset_x_px:.1f}px, {offset_y_px:.1f}px)")
+                    print(f"Ground sample distance: {gsd:.6f} meters/pixel")
+                    print(f"Object position: {object_lat:.8f}, {object_lon:.8f}")
+                    print("DEBUG: AprilTag detections found:", len(detections))
+                    print("DEBUG: AprilTag result structure:")
+                    print(f"DEBUG: {json.dumps(detections, indent=2, default=str)}")    
+                    print(f"DEBUG: AprilTag center: ({bbox_center_x}, {bbox_center_y})")
+                    print(f"DEBUG: Image dimensions: {image_width} x {image_height}")
+                    print(f"DEBUG: AprilTag ID: {detection.get('id', 'unknown')}")
+                    print(f"DEBUG: Sensor width: {sensor_width_mm}mm")
+                    print(f"DEBUG: Altitude: {alt:.2f}m (GPS units)")
+                    print(f"DEBUG: Image width: {image_width}px")
+                    print(f"DEBUG: Effective focal length: {effective_focal_length:.2f}mm")
+                    print(f"DEBUG: GSD calculation: ({alt:.2f} * {sensor_width_mm}) / ({effective_focal_length:.2f} * {image_width}) = {gsd:.6f}")
+                    print(f'DEBUG: Ground sample distance: {gsd:.6f} meters/pixel')
+                    print(f"DEBUG: Digital zoom ratio: {digital_zoom_ratio:.2f}x")
+                    print(f"DEBUG: 35mm focal length: {focal_length_35mm}mm")
+                    print(f"DEBUG: **************************************************" )
+                    
+                    # Add result for this detection
+                    result = {
+                        'latitude': object_lat,
+                        'longitude': object_lon,
+                        'object_lat': object_lat,
+                        'object_lon': object_lon,
+                        'image_lat': lat,
+                        'image_lon': lon,
+                        'altitude': alt,
+                        'detected_class': 'apriltag',
+                        'confidence': 1.0,  # AprilTag detection is binary
+                        'apriltag_id': detection.get('id', 'unknown')
+                    }
+                    results.append(result)
+                    logger.info(f"✅ Calculated coordinates for AprilTag ID {apriltag_id}: ({object_lat:.6f}, {object_lon:.6f})")
                 
                 # Clean up temporary file
                 os.remove(local_image_path)
                 
-                return {
-                    'latitude': object_lat,
-                    'longitude': object_lon,
-                    'object_lat': object_lat,
-                    'object_lon': object_lon,
-                    'image_lat': lat,
-                    'image_lon': lon,
-                    'altitude': alt,
-                    'detected_class': 'apriltag',
-                    'confidence': 1.0,  # AprilTag detection is binary
-                    'apriltag_id': detection.get('id', 'unknown')
-                }
+                return results
             else:
                 logger.error("No AprilTag detections found")
-                return None
+                return []
                 
         except subprocess.CalledProcessError as e:
             logger.error(f"AprilTag detection failed: {e}")
@@ -2075,23 +2083,66 @@ def store_image_result(task_id: str, s3_image_url: str, image_result: ImageQRRes
             for qr in image_result.qr_results
         ]
 
-        realworld_coordinates = get_realworld_coordinates(s3_image_url)
-        # there can be multiple april tag detections and we need to store, so maybe we should create a seperate record for each
-        # we will also need to update realworld_coordinates to take qr content as input. and return a list of result dicts.
-
-        supabase.table('qr_processed_images').insert({
-            'task_id': task_id,
-            'filename': image_result.image_name,
-            's3_input_url': s3_image_url,
-            'image_signed_url': image_result.image_url,
-            'timestamp': datetime.now().isoformat(),
-            'latitude': realworld_coordinates.get('latitude') if realworld_coordinates else None,
-            'longitude': realworld_coordinates.get('longitude') if realworld_coordinates else None,
-            'qr_results': qr_results_json,
-            'processing_status': 'success' if image_result.success else 'failed',
-            'error_message': image_result.error,
-            'processed_at': datetime.now().isoformat()
-        }).execute()
+        realworld_coordinates_list = get_realworld_coordinates(s3_image_url)
+        logger.info(f"Processing image {image_result.image_name}: Found {len(realworld_coordinates_list) if realworld_coordinates_list else 0} AprilTag detections")
+        
+        # Handle multiple AprilTag detections - create separate records for each
+        if realworld_coordinates_list:
+            # Create a separate record for each AprilTag detection
+            records_to_insert = []
+            for i, realworld_coordinates in enumerate(realworld_coordinates_list):
+                # Filter QR results to only include those matching this specific AprilTag ID
+                apriltag_id = realworld_coordinates.get('apriltag_id')
+                logger.info(f"Processing detection {i+1}/{len(realworld_coordinates_list)}: AprilTag ID {apriltag_id} at ({realworld_coordinates.get('latitude', 'N/A'):.6f}, {realworld_coordinates.get('longitude', 'N/A'):.6f})")
+                
+                filtered_qr_results = [
+                    qr for qr in qr_results_json 
+                    if str(qr.get('content', '')) == str(apriltag_id)
+                ]
+                logger.info(f"Found {len(filtered_qr_results)} matching QR results for AprilTag ID {apriltag_id}")
+                
+                record = {
+                    'task_id': task_id,
+                    'filename': image_result.image_name,
+                    's3_input_url': s3_image_url,
+                    'image_signed_url': image_result.image_url,
+                    'timestamp': datetime.now().isoformat(),
+                    'latitude': realworld_coordinates.get('latitude'),
+                    'longitude': realworld_coordinates.get('longitude'),
+                    'qr_results': filtered_qr_results,  # Only QR results for this specific AprilTag
+                    'processing_status': 'success' if image_result.success else 'failed',
+                    'error_message': image_result.error,
+                    'processed_at': datetime.now().isoformat()
+                }
+                records_to_insert.append(record)
+            
+            # Insert all records at once
+            if records_to_insert:
+                logger.info(f"Attempting to insert {len(records_to_insert)} records into database for {image_result.image_name}")
+                try:
+                    result = supabase.table('qr_processed_images').insert(records_to_insert).execute()
+                    logger.info(f"✅ Successfully inserted {len(records_to_insert)} AprilTag detection records for {image_result.image_name}")
+                    logger.info(f"Database response: {result}")
+                except Exception as db_error:
+                    logger.error(f"❌ Database insertion failed for {image_result.image_name}: {str(db_error)}")
+                    logger.error(f"Records that failed to insert: {records_to_insert}")
+                    raise
+        else:
+            # No detections found, create a single record with no coordinates
+            logger.info(f"No AprilTag detections found for {image_result.image_name}, creating single record")
+            supabase.table('qr_processed_images').insert({
+                'task_id': task_id,
+                'filename': image_result.image_name,
+                's3_input_url': s3_image_url,
+                'image_signed_url': image_result.image_url,
+                'timestamp': datetime.now().isoformat(),
+                'latitude': None,
+                'longitude': None,
+                'qr_results': qr_results_json,
+                'processing_status': 'success' if image_result.success else 'failed',
+                'error_message': image_result.error,
+                'processed_at': datetime.now().isoformat(),
+            }).execute()
         return True
     except Exception as e:
         logger.error(f"Error storing image result: {str(e)}")
