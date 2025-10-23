@@ -232,6 +232,24 @@ class VINDashboardResponse(BaseModel):
     total_vins: int
     total_folders: int
 
+# AprilTag Detection Models
+class AprilTagDetection(BaseModel):
+    id: int
+    center: Dict[str, float]  # {"x": float, "y": float}
+    corners: List[Dict[str, float]]  # [{"x": float, "y": float}, ...]
+    confidence: float
+
+class AprilTagDetectionRequest(BaseModel):
+    image: str  # Base64 encoded image
+    format: str = "json"  # "json" or "binary"
+
+class AprilTagDetectionResponse(BaseModel):
+    success: bool
+    detections: List[AprilTagDetection]
+    total_detections: int
+    message: str
+    binary_data: Optional[bytes] = None  # For binary format output
+
 class MovementPoint(BaseModel):
     latitude: float
     longitude: float
@@ -2058,7 +2076,9 @@ def store_image_result(task_id: str, s3_image_url: str, image_result: ImageQRRes
         ]
 
         realworld_coordinates = get_realworld_coordinates(s3_image_url)
-        
+        # there can be multiple april tag detections and we need to store, so maybe we should create a seperate record for each
+        # we will also need to update realworld_coordinates to take qr content as input. and return a list of result dicts.
+
         supabase.table('qr_processed_images').insert({
             'task_id': task_id,
             'filename': image_result.image_name,
@@ -3018,6 +3038,112 @@ async def get_vin_movement_path_endpoint(vin: str, folder_filter: Optional[str] 
     except Exception as e:
         logger.error(f"Error fetching movement path for {vin}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch movement path: {str(e)}")
+
+@app.post("/detect-apriltag", response_model=AprilTagDetectionResponse)
+async def detect_apriltag(request: AprilTagDetectionRequest):
+    """Detect AprilTags in an image and return results in JSON or binary format
+    
+    Args:
+        request: AprilTagDetectionRequest containing base64 image and output format
+    """
+    try:
+        logger.info(f"Processing AprilTag detection request with format: {request.format}")
+        
+        # Decode the base64 image
+        try:
+            # Strip data URL prefix if present
+            image_data = request.image
+            if image_data.startswith('data:'):
+                image_data = image_data.split(',', 1)[1]
+            
+            # Decode base64
+            image_bytes = base64.b64decode(image_data)
+            img = Image.open(io.BytesIO(image_bytes)).convert('L')
+            
+        except Exception as e:
+            logger.error(f"Failed to decode base64 image: {e}")
+            raise HTTPException(status_code=400, detail=f"Invalid base64 image data: {str(e)}")
+        
+        # Save to temporary PGM file for AprilTag detector
+        with tempfile.NamedTemporaryFile(suffix=".pgm", delete=False) as f:
+            tmp_path = f.name
+        
+        try:
+            img.save(tmp_path)
+            
+            # Run AprilTag detection
+            result = subprocess.run([AT_EXE, tmp_path], 
+                                  capture_output=True, text=True, check=True)
+            
+            # Parse JSON output
+            json_text = '[]'
+            for line in result.stdout.splitlines():
+                idx = line.find('[')
+                if idx != -1:
+                    json_text = line[idx:]
+                    break
+            
+            detections = json.loads(json_text)
+            
+            if not detections:
+                return AprilTagDetectionResponse(
+                    success=True,
+                    detections=[],
+                    total_detections=0,
+                    message="No AprilTags detected in the image"
+                )
+            
+            # Convert to our response format
+            apriltag_detections = []
+            for detection in detections:
+                apriltag_detections.append(AprilTagDetection(
+                    id=detection.get('id', 0),
+                    center=detection.get('center', {'x': 0.0, 'y': 0.0}),
+                    corners=detection.get('corners', []),
+                    confidence=detection.get('confidence', 1.0)
+                ))
+            
+            # Handle binary format if requested
+            binary_data = None
+            if request.format.lower() == "binary":
+                # Convert detections to binary format
+                binary_data = json.dumps([{
+                    'id': det.id,
+                    'center': det.center,
+                    'corners': det.corners,
+                    'confidence': det.confidence
+                } for det in apriltag_detections]).encode('utf-8')
+            
+            return AprilTagDetectionResponse(
+                success=True,
+                detections=apriltag_detections,
+                total_detections=len(apriltag_detections),
+                message=f"Successfully detected {len(apriltag_detections)} AprilTag(s)",
+                binary_data=binary_data
+            )
+            
+        except subprocess.CalledProcessError as e:
+            logger.error(f"AprilTag detection failed: {e}")
+            logger.error(f"stderr: {e.stderr}")
+            raise HTTPException(status_code=500, detail=f"AprilTag detection failed: {e.stderr}")
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse AprilTag JSON response: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to parse detection results: {str(e)}")
+        except Exception as e:
+            logger.error(f"AprilTag detection error: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"AprilTag detection error: {str(e)}")
+        finally:
+            # Clean up temporary file
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+                
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in AprilTag detection: {e}")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
