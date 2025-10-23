@@ -1670,6 +1670,128 @@ def read_exif_basic(path, debug=False):
     return lat, lon, alt, heading, realworld_data
 
 
+def pixel_to_latlon(
+    x: float,
+    y: float,
+    W: float,
+    H: float,
+    W_m: float,
+    H_m: float,
+    lat_c: float,
+    lon_c: float,
+    gimbal_yaw_deg: float
+):
+    """
+    Convert image pixel (x, y) to latitude/longitude using image center,
+    ground coverage, and gimbal yaw.
+
+    Parameters
+    ----------
+    x, y : float
+        Pixel coordinates (origin top-left, x→right, y→down) //this will be the center of the april tag from the top left of the entrie photo.
+    W, H : float
+        Image width and height in pixels 
+    W_m, H_m : float
+        Ground coverage width and height in meters .
+    lat_c, lon_c : float
+        Latitude and longitude of the image center (decimal degrees).
+    gimbal_yaw_deg : float
+        Gimbal yaw (degrees). Positive = clockwise from true north.
+        Example: -123.2 from your telemetry.
+
+    Returns
+    -------
+    lat, lon : tuple(float, float)
+        Latitude and longitude of the pixel (decimal degrees).
+    """
+    import math
+
+    # --- Step 1: basic constants ---
+    meters_per_px_x = W_m / W
+    meters_per_px_y = H_m / H
+    theta = math.radians(gimbal_yaw_deg)  # convert to radians
+
+    # --- Step 2: pixel offset from image center (y positive up) ---
+    x_img = (x - W / 2.0) * meters_per_px_x
+    y_img = (H / 2.0 - y) * meters_per_px_y
+
+    # --- Step 3: rotate image coordinates by yaw ---
+    east_m  =  x_img * math.cos(theta) + y_img * math.sin(theta)
+    north_m = -x_img * math.sin(theta) + y_img * math.cos(theta)
+
+    # --- Step 4: convert meters → degrees ---
+    dlat = north_m / 111320.0
+    dlon = east_m / (111320.0 * math.cos(math.radians(lat_c)))
+
+    # --- Step 5: final lat/lon ---
+    lat = lat_c + dlat
+    lon = lon_c + dlon
+    return lat, lon
+
+def read_xmp_metadata(image_path: str) -> Dict[str, str]:
+    """Read XMP metadata from image file"""
+    try:
+        # Read the file as binary and look for XMP data
+        with open(image_path, 'rb') as f:
+            content = f.read()
+            
+        # Look for XMP data patterns
+        xmp_data = {}
+        
+        # Look for orientation data in the file content
+        orientation_patterns = [
+            b'GimbalRollDegree',
+            b'GimbalYawDegree', 
+            b'GimbalPitchDegree',
+            b'FlightRollDegree',
+            b'FlightYawDegree',
+            b'FlightPitchDegree'
+        ]
+        
+        for pattern in orientation_patterns:
+            # Find the pattern in the file
+            pos = content.find(pattern)
+            if pos != -1:
+                # Look for the value after the pattern
+                # Find the next '=' after the pattern
+                value_start = pos + len(pattern)
+                while value_start < len(content) and content[value_start] != b'='[0]:
+                    value_start += 1
+                
+                if value_start < len(content):
+                    # Skip the '=' and look for the opening quote
+                    value_start += 1
+                    while value_start < len(content) and content[value_start] != b'"'[0]:
+                        value_start += 1
+                    
+                    if value_start < len(content):
+                        # Skip the opening quote
+                        value_start += 1
+                        # Find the closing quote
+                        value_end = value_start
+                        while value_end < len(content) and content[value_end] != b'"'[0]:
+                            value_end += 1
+                        
+                        if value_end > value_start:
+                            try:
+                                value = content[value_start:value_end].decode('utf-8', errors='ignore').strip()
+                                # Clean up the value (remove + sign, etc.)
+                                if value.startswith('+'):
+                                    value = value[1:]
+                                xmp_data[pattern.decode('utf-8').lower()] = value
+                            except:
+                                pass
+        
+        if xmp_data:
+            print(f"DEBUG: Found XMP orientation data: {xmp_data}")
+            return xmp_data
+                
+    except Exception as e:
+        logger.error(f"Error reading XMP metadata: {str(e)}")
+    
+    return None
+
+
 def get_realworld_coordinates(s3_image_url: str) -> Dict[str, float]:
     """Get realworld coordinates from image coordinates"""
     try:
@@ -1697,41 +1819,72 @@ def get_realworld_coordinates(s3_image_url: str) -> Dict[str, float]:
         # Extract EXIF data
         lat, lon, alt, heading, realworld_data = read_exif_basic(local_image_path)
         
+        # Also extract XMP metadata for orientation data
+        xmp_data = read_xmp_metadata(local_image_path)
+        if xmp_data:
+            realworld_data.update(xmp_data)
+        
         if lat is None or lon is None or alt is None:
             logger.error("Missing GPS data in EXIF")
             return None
         
-        # Run Roboflow workflow
-        roboflow_client = get_roboflow_client()
-        result = roboflow_client.run_workflow(
-            workspace_name=ROBOFLOW_WORKSPACE,
-            workflow_id=QR_WORKFLOW_ID,
-            images={"image": local_image_path}
-        )
-        
-        # Debug: Print the result structure
+        # Run AprilTag detection
+        import subprocess
         import json
-        print("DEBUG: Roboflow result structure:")
-        print(json.dumps(result, indent=2, default=str))
+        import tempfile
+        from PIL import Image
         
-        # Handle the array structure - result is wrapped in an array
-        if isinstance(result, list) and len(result) > 0:
-            result = result[0]
+        AT_EXE = "/home/ubuntu/workflows/qr_code_app/atagjs_example"
         
-        # Extract predictions and find highest confidence
-        if 'model_predictions' in result and 'predictions' in result['model_predictions']:
-            predictions = result['model_predictions']['predictions']
-            if predictions:
-                # Find prediction with highest confidence
-                best_prediction = max(predictions, key=lambda p: p['confidence'])
+        try:
+            # Convert image to PGM format for AprilTag detector
+            img = Image.open(local_image_path)
+            # Convert to grayscale if needed
+            if img.mode != 'L':
+                img = img.convert('L')
+            
+            # Save to a temporary PGM for the detector (avoids JPEG loader/crash issues)
+            with tempfile.NamedTemporaryFile(suffix=".pgm", delete=False) as f:
+                tmp_pgm_path = f.name
+            try:
+                img.save(tmp_pgm_path)
                 
-                # Get bbox center coordinates
-                bbox_center_x = best_prediction['x']
-                bbox_center_y = best_prediction['y']
+                # Run AprilTag detection on PGM file
+                result = subprocess.run([AT_EXE, tmp_pgm_path], 
+                                      capture_output=True, text=True, check=True)
                 
-                # Get image dimensions
-                image_width = result['model_predictions']['image']['width']
-                image_height = result['model_predictions']['image']['height']
+                # Parse JSON response - extract JSON from mixed output
+                json_text = '[]'
+                for line in result.stdout.splitlines():
+                    idx = line.find('[')
+                    if idx != -1:
+                        json_text = line[idx:]
+                        break
+                
+                # Parse the JSON array
+                detections = json.loads(json_text)
+            finally:
+                # Clean up temporary PGM file
+                import os
+                if os.path.exists(tmp_pgm_path):
+                    os.remove(tmp_pgm_path)
+            
+        
+            if detections:
+                # Use first detection
+                detection = detections[0]
+                
+                # Get center coordinates from AprilTag detection
+                center = detection['center']
+                bbox_center_x = center['x']
+                bbox_center_y = center['y']
+                
+                # Get image dimensions from the image itself
+                from PIL import Image
+                with Image.open(local_image_path) as img:
+                    image_width, image_height = img.size
+                
+             
                 
                 # Extract focal length from EXIF data
                 focal_length_mm = None
@@ -1750,17 +1903,106 @@ def get_realworld_coordinates(s3_image_url: str) -> Dict[str, float]:
                     logger.error("Could not extract focal length from EXIF")
                     return None
                 
-                # Estimate object GPS coordinates
-                object_lat, object_lon = estimate_object_gps(
-                    center_lat=lat,
-                    center_lon=lon,
-                    altitude_m=alt,
-                    focal_length_mm=focal_length_mm,
-                    sensor_width_mm=36.0,  # Standard 35mm sensor width
-                    image_width_px=image_width,
-                    bbox_center_px=(bbox_center_x, bbox_center_y),
-                    image_size_px=(image_width, image_height)
+                # Calculate object position using simple offset from image center
+                # Image center coordinates (drone position)
+                image_center_x = image_width / 2
+                image_center_y = image_height / 2
+                
+                # Calculate offset from image center to AprilTag center
+                offset_x_px = bbox_center_x - image_center_x
+                offset_y_px = bbox_center_y - image_center_y
+                
+                # Convert pixel offset to meters using ground sample distance
+                # Use 35mm equivalent focal length for GSD calculation
+                focal_length_35mm = None
+                
+                # Read EXIF tags to get 35mm equivalent focal length
+                import exifread
+                with open(local_image_path, 'rb') as f:
+                    tags = exifread.process_file(f)
+                
+                if "EXIF FocalLengthIn35mmFilm" in tags:
+                    focal_length_35mm_tag = tags["EXIF FocalLengthIn35mmFilm"]
+                    if hasattr(focal_length_35mm_tag, 'printable'):
+                        focal_length_35mm = float(focal_length_35mm_tag.printable)
+                
+                if focal_length_35mm is None:
+                    focal_length_35mm = focal_length_mm  # fallback to actual focal length
+                
+                # Get digital zoom ratio and apply it to focal length
+                digital_zoom_ratio = 1.0  # default no zoom
+                if "EXIF DigitalZoomRatio" in tags:
+                    zoom_tag = tags["EXIF DigitalZoomRatio"]
+                    if hasattr(zoom_tag, 'printable'):
+                        try:
+                            if '/' in zoom_tag.printable:
+                                num, den = map(float, zoom_tag.printable.split('/'))
+                                digital_zoom_ratio = num / den
+                            else:
+                                digital_zoom_ratio = float(zoom_tag.printable)
+                        except (ValueError, ZeroDivisionError):
+                            digital_zoom_ratio = 1.0
+                
+                # Apply zoom to effective focal length
+                effective_focal_length = focal_length_35mm * digital_zoom_ratio
+                
+                # Define sensor width for DJI M3TD with 1/2-inch CMOS sensor
+                sensor_width_mm = 6.4  # 1/2-inch sensor width (4:3 aspect ratio)
+                
+                # Ground sample distance = (altitude * sensor_width) / (effective_focal_length * image_width)
+                gsd = (alt * sensor_width_mm) / (effective_focal_length * image_width)
+
+            
+                
+                # Calculate ground coverage in meters using GSD
+                W_m = image_width * gsd  # Ground coverage width in meters
+                H_m = image_height * gsd  # Ground coverage height in meters
+                
+                # Get gimbal yaw from XMP data
+                gimbal_yaw_deg = 0.0
+                if realworld_data.get('gimbalyawdegree'):
+                    try:
+                        gimbal_yaw_deg = float(realworld_data['gimbalyawdegree'])
+                    except:
+                        gimbal_yaw_deg = 0.0
+                
+                print(f"DEBUG: Ground coverage: {W_m:.2f}m x {H_m:.2f}m")
+                print(f"DEBUG: Gimbal yaw: {gimbal_yaw_deg:.2f}°")
+                print(f"DEBUG: AprilTag center: ({bbox_center_x:.1f}, {bbox_center_y:.1f})")
+                
+                # Use the new pixel_to_latlon function
+                object_lat, object_lon = pixel_to_latlon(
+                    bbox_center_x, bbox_center_y,  # AprilTag center coordinates
+                    image_width, image_height,      # Image dimensions
+                    W_m, H_m,                      # Ground coverage in meters
+                    lat, lon,                      # Image center (drone position)
+                    gimbal_yaw_deg                 # Gimbal yaw angle
                 )
+                
+                # Debug output
+                print(f"DEBUG: === OBJECT POSITION CALCULATION ===")
+                print(f"DEBUG: {s3_image_url}")
+                print(f"Image dimensions: {image_width} x {image_height}")
+                print(f"Image center (drone position): {lat:.8f}, {lon:.8f}")
+                print(f"Bbox center: ({bbox_center_x}, {bbox_center_y})")
+                print(f"Offset from center: ({offset_x_px:.1f}px, {offset_y_px:.1f}px)")
+                print(f"Ground sample distance: {gsd:.6f} meters/pixel")
+                print(f"Object position: {object_lat:.8f}, {object_lon:.8f}")
+                print("DEBUG: AprilTag detections found:", len(detections))
+                print("DEBUG: AprilTag result structure:")
+                print(f"DEBUG: {json.dumps(detections, indent=2, default=str)}")    
+                print(f"DEBUG: AprilTag center: ({bbox_center_x}, {bbox_center_y})")
+                print(f"DEBUG: Image dimensions: {image_width} x {image_height}")
+                print(f"DEBUG: AprilTag ID: {detection.get('id', 'unknown')}")
+                print(f"DEBUG: Sensor width: {sensor_width_mm}mm")
+                print(f"DEBUG: Altitude: {alt:.2f}m (GPS units)")
+                print(f"DEBUG: Image width: {image_width}px")
+                print(f"DEBUG: Effective focal length: {effective_focal_length:.2f}mm")
+                print(f"DEBUG: GSD calculation: ({alt:.2f} * {sensor_width_mm}) / ({effective_focal_length:.2f} * {image_width}) = {gsd:.6f}")
+                print(f'DEBUG: Ground sample distance: {gsd:.6f} meters/pixel')
+                print(f"DEBUG: Digital zoom ratio: {digital_zoom_ratio:.2f}x")
+                print(f"DEBUG: 35mm focal length: {focal_length_35mm}mm")
+                print(f"DEBUG: **************************************************" )
                 
                 # Clean up temporary file
                 os.remove(local_image_path)
@@ -1773,14 +2015,23 @@ def get_realworld_coordinates(s3_image_url: str) -> Dict[str, float]:
                     'image_lat': lat,
                     'image_lon': lon,
                     'altitude': alt,
-                    'detected_class': best_prediction['class'],
-                    'confidence': best_prediction['confidence']
+                    'detected_class': 'apriltag',
+                    'confidence': 1.0,  # AprilTag detection is binary
+                    'apriltag_id': detection.get('id', 'unknown')
                 }
             else:
-                logger.error("No predictions found in Roboflow result")
+                logger.error("No AprilTag detections found")
                 return None
-        else:
-            logger.error("Invalid Roboflow result format")
+                
+        except subprocess.CalledProcessError as e:
+            logger.error(f"AprilTag detection failed: {e}")
+            logger.error(f"stderr: {e.stderr}")
+            return None
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse AprilTag JSON response: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"AprilTag detection error: {str(e)}")
             return None
             
     except Exception as e:
