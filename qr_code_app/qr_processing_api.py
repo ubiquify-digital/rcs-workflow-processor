@@ -123,6 +123,7 @@ class ImageQRResult(BaseModel):
     qr_results: List[QRResult] = []
     success: bool
     error: Optional[str] = None
+    bbox_visualization_url: Optional[str] = None  # Signed S3 URL for bounding box visualization
 
 class QRProcessResponse(BaseModel):
     success: bool
@@ -191,6 +192,7 @@ class VINHistory(BaseModel):
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     confidence: float
+    bbox_visualization_url: Optional[str] = None
 
 class VINSummary(BaseModel):
     vin: str
@@ -456,46 +458,80 @@ def convert_to_degrees(value):
         return float(d) + float(m)/60 + float(s)/3600
     return 0.0
 
+def detect_apriltags_enhanced(image_data: bytes) -> List[Dict[str, Any]]:
+    """Enhanced AprilTag detection with preprocessing. Returns list of detection dictionaries."""
+    try:
+        # Load and preprocess image
+        img = Image.open(io.BytesIO(image_data))
+        
+        # Convert to grayscale
+        if img.mode != 'L':
+            img = img.convert('L')
+        
+        # Apply conservative image preprocessing
+        import cv2
+        import numpy as np
+        
+        img_array = np.array(img)
+        
+        # Apply gentle contrast enhancement using CLAHE
+        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(16,16))
+        img_enhanced = clahe.apply(img_array)
+        
+        # Apply very light Gaussian blur to reduce noise
+        img_denoised = cv2.GaussianBlur(img_enhanced, (1, 1), 0)
+        
+        # Convert back to PIL Image
+        img_processed = Image.fromarray(img_denoised)
+        
+        # Save to temporary PGM file
+        with tempfile.NamedTemporaryFile(suffix=".pgm", delete=False) as f:
+            tmp_path = f.name
+        try:
+            img_processed.save(tmp_path)
+            
+            # Run AprilTag detection
+            result = subprocess.run([AT_EXE, tmp_path], 
+                                  capture_output=True, text=True, check=True)
+            
+            # Parse JSON output
+            json_text = '[]'
+            for line in result.stdout.splitlines():
+                idx = line.find('[')
+                if idx != -1:
+                    json_text = line[idx:]
+                    break
+            
+            detections = json.loads(json_text)
+            return detections
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning(f"Could not detect AprilTags: {str(e)}")
+        return []
+
 def decode_qr_from_base64(base64_string: str) -> List[str]:
-    """Decode AprilTag (tagStandard52h13) from a base64 image using external detector binary.
-    Writes a temporary PGM to match detector stability.
+    """Decode AprilTag (tagStandard52h13) from a base64 image using enhanced detection.
     Returns a list of all detected tag IDs."""
     try:
         # Strip data URL prefix if present
         if base64_string.startswith('data:'):
             base64_string = base64_string.split(',', 1)[1]
 
-        # Load to grayscale
+        # Decode base64
         image_data = base64.b64decode(base64_string)
-        img = Image.open(io.BytesIO(image_data)).convert('L')
+        
+        # Use enhanced detection
+        detections = detect_apriltags_enhanced(image_data)
+        
+        if not detections:
+            return []
 
-        # Save to a temporary PGM for the detector (avoids JPEG loader/crash issues)
-        with tempfile.NamedTemporaryFile(suffix=".pgm", delete=False) as f:
-            tmp_path = f.name
-        try:
-            img.save(tmp_path)
-
-            # Execute detector
-            out = subprocess.check_output([AT_EXE, tmp_path], stderr=subprocess.STDOUT, text=True)
-
-            # Extract JSON array even if prefixed (e.g., "###Size... [ {...} ]")
-            json_text = '[]'
-            for l in out.splitlines():
-                idx = l.find('[')
-                if idx != -1:
-                    json_text = l[idx:]
-                    break
-            dets = json.loads(json_text)
-            if not dets:
-                return []
-
-            # Return all tag IDs as strings
-            return [str(det.get("id")) for det in dets if det.get("id") is not None]
-        finally:
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
+        # Return all tag IDs as strings
+        return [str(det.get("id")) for det in detections if det.get("id") is not None]
     except Exception as e:
         logger.warning(f"Could not decode AprilTag: {str(e)}")
         return []
@@ -598,6 +634,47 @@ def upload_qr_to_s3(file_bytes: bytes, s3_key: str) -> str:
     except Exception as e:
         logger.error(f"Error uploading QR to S3: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to upload QR to S3: {str(e)}")
+
+def upload_bbox_visualization_to_s3(bbox_image_data, image_name: str, task_id: str) -> str:
+    """Upload bounding box visualization to S3 and return the S3 URL"""
+    try:
+        # Handle different data types for bounding box visualization
+        if isinstance(bbox_image_data, str):
+            # If it's a string, try to decode as base64
+            import base64
+            try:
+                image_data = base64.b64decode(bbox_image_data)
+            except Exception as e:
+                logger.warning(f"Failed to decode as base64, treating as raw data: {e}")
+                image_data = bbox_image_data.encode('utf-8')
+        elif isinstance(bbox_image_data, list):
+            # If it's a list (raw image data), convert to bytes
+            image_data = bytes(bbox_image_data)
+        else:
+            # Convert to bytes
+            image_data = bytes(bbox_image_data)
+        
+        # Create S3 key for bounding box visualization
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_filename = image_name.replace("/", "_").replace("\\", "_").replace(" ", "_")
+        s3_key = f"bbox_visualizations/{task_id}/{safe_filename}_{timestamp}_bbox.png"
+        
+        # Upload to S3
+        s3_client = boto3.client('s3')
+        s3_client.put_object(
+            Bucket=os.getenv("S3_BUCKET", "rcsstoragebucket"),
+            Key=s3_key,
+            Body=image_data,
+            ContentType='image/png'
+        )
+        
+        s3_url = f"s3://{os.getenv('S3_BUCKET', 'rcsstoragebucket')}/{s3_key}"
+        logger.info(f"✅ Uploaded bounding box visualization to: {s3_url}")
+        return s3_url
+        
+    except Exception as e:
+        logger.error(f"Error uploading bounding box visualization to S3: {str(e)}")
+        raise
 
 def store_qr_record(qr_code_id: str, description: Optional[str], s3_url: str, size: int) -> str:
     """Store QR code record in database with ID-based system"""
@@ -719,6 +796,17 @@ def cluster_vin_sightings(vin_data: List[Dict[str, Any]], radius_meters: float =
             # Use the most recent timestamp from the cluster
             representative["spotted_at"] = max(s["spotted_at"] for s in cluster)
             
+            # Calculate average latitude and longitude for the cluster
+            valid_coords = [s for s in cluster if s.get("latitude") is not None and s.get("longitude") is not None]
+            if valid_coords:
+                avg_lat = sum(s["latitude"] for s in valid_coords) / len(valid_coords)
+                avg_lon = sum(s["longitude"] for s in valid_coords) / len(valid_coords)
+                representative["latitude"] = avg_lat
+                representative["longitude"] = avg_lon
+                logger.info(f"Clustered {len(cluster)} sightings: avg lat={avg_lat:.6f}, avg lon={avg_lon:.6f}")
+            else:
+                logger.warning(f"No valid coordinates found in cluster of {len(cluster)} sightings")
+            
             clustered_data.append(representative)
     
     return clustered_data
@@ -736,7 +824,7 @@ def get_all_vins_from_processed_images(folder_filter: Optional[List[str]] = None
     try:
         # Get all processed images with QR results
         result = supabase.table("qr_processed_images").select(
-            "id, filename, s3_input_url, image_signed_url, timestamp, latitude, longitude, qr_results, task_id"
+            "id, filename, s3_input_url, image_signed_url, timestamp, latitude, longitude, qr_results, task_id, bbox_visualization_url"
         ).eq("processing_status", "success").execute()
         
         # Get folder information (always get all folders for proper mapping)
@@ -758,6 +846,26 @@ def get_all_vins_from_processed_images(folder_filter: Optional[List[str]] = None
                     resolved_vin = resolve_qr_code_to_vin(content)
                     
                     if resolved_vin:
+                        # Generate fresh signed URL for bounding box visualization if available
+                        bbox_visualization_url = None
+                        if image.get("bbox_visualization_url"):
+                            bbox_url = image["bbox_visualization_url"]
+                            try:
+                                # If it's already a signed URL, extract the S3 key and generate fresh signed URL
+                                if bbox_url.startswith("https://"):
+                                    # Extract S3 key from signed URL
+                                    # Format: https://bucket.s3.region.amazonaws.com/key?params
+                                    from urllib.parse import urlparse
+                                    parsed_url = urlparse(bbox_url)
+                                    s3_key = parsed_url.path.lstrip('/')
+                                    s3_uri = f"s3://{os.getenv('S3_BUCKET', 'rcsstoragebucket')}/{s3_key}"
+                                    bbox_visualization_url = get_s3_signed_url(s3_uri)
+                                else:
+                                    # It's already an S3 URI, generate signed URL directly
+                                    bbox_visualization_url = get_s3_signed_url(bbox_url)
+                            except Exception as e:
+                                logger.warning(f"Failed to generate fresh signed URL for bbox visualization: {str(e)}")
+                        
                         vin_data.append({
                             "vin": resolved_vin,
                             "qr_code_id": content if len(content) != 17 else None,  # Store original QR code ID if not a direct VIN
@@ -769,7 +877,8 @@ def get_all_vins_from_processed_images(folder_filter: Optional[List[str]] = None
                             "longitude": image.get("longitude"),
                             "folder_name": folder_info.get("folder_name", "Unknown"),
                             "folder_s3_url": folder_info.get("s3_input_folder_url", ""),
-                            "task_id": image["task_id"]
+                            "task_id": image["task_id"],
+                            "bbox_visualization_url": bbox_visualization_url
                         })
         
         # Apply folder filtering if specified
@@ -1846,47 +1955,15 @@ def get_realworld_coordinates(s3_image_url: str) -> List[Dict[str, float]]:
             logger.error("Missing GPS data in EXIF")
             return None
         
-        # Run AprilTag detection
-        import subprocess
-        import json
-        import tempfile
-        from PIL import Image
-        
-        AT_EXE = "/home/ubuntu/workflows/qr_code_app/atagjs_example"
-        
+        # Run enhanced AprilTag detection
         try:
-            # Convert image to PGM format for AprilTag detector
-            img = Image.open(local_image_path)
-            # Convert to grayscale if needed
-            if img.mode != 'L':
-                img = img.convert('L')
+            # Read image data
+            with open(local_image_path, 'rb') as f:
+                image_data = f.read()
             
-            # Save to a temporary PGM for the detector (avoids JPEG loader/crash issues)
-            with tempfile.NamedTemporaryFile(suffix=".pgm", delete=False) as f:
-                tmp_pgm_path = f.name
-            try:
-                img.save(tmp_pgm_path)
-                
-                # Run AprilTag detection on PGM file
-                result = subprocess.run([AT_EXE, tmp_pgm_path], 
-                                      capture_output=True, text=True, check=True)
-                
-                # Parse JSON response - extract JSON from mixed output
-                json_text = '[]'
-                for line in result.stdout.splitlines():
-                    idx = line.find('[')
-                    if idx != -1:
-                        json_text = line[idx:]
-                        break
-                
-                # Parse the JSON array
-                detections = json.loads(json_text)
-                logger.info(f"AprilTag detector found {len(detections)} detections in image")
-            finally:
-                # Clean up temporary PGM file
-                import os
-                if os.path.exists(tmp_pgm_path):
-                    os.remove(tmp_pgm_path)
+            # Use enhanced detection with preprocessing
+            detections = detect_apriltags_enhanced(image_data)
+            logger.info(f"Enhanced AprilTag detector found {len(detections)} detections in image")
             
         
             if detections:
@@ -2112,7 +2189,8 @@ def store_image_result(task_id: str, s3_image_url: str, image_result: ImageQRRes
                     'qr_results': filtered_qr_results,  # Only QR results for this specific AprilTag
                     'processing_status': 'success' if image_result.success else 'failed',
                     'error_message': image_result.error,
-                    'processed_at': datetime.now().isoformat()
+                    'processed_at': datetime.now().isoformat(),
+                    'bbox_visualization_url': image_result.bbox_visualization_url
                 }
                 records_to_insert.append(record)
             
@@ -2142,6 +2220,7 @@ def store_image_result(task_id: str, s3_image_url: str, image_result: ImageQRRes
                 'processing_status': 'success' if image_result.success else 'failed',
                 'error_message': image_result.error,
                 'processed_at': datetime.now().isoformat(),
+                'bbox_visualization_url': image_result.bbox_visualization_url
             }).execute()
         return True
     except Exception as e:
@@ -2176,13 +2255,22 @@ def convert_cached_result_to_image_qr_result(cached_result: Dict[str, Any]) -> I
             logger.warning(f"Failed to generate fresh signed URL for {cached_result['filename']}: {str(e)}")
             fresh_signed_url = s3_input_url  # Fallback to original S3 URL
     
+    # Generate fresh signed URL for bounding box visualization if available
+    bbox_visualization_url = None
+    if cached_result.get('bbox_visualization_url'):
+        try:
+            bbox_visualization_url = get_s3_signed_url(cached_result['bbox_visualization_url'])
+        except Exception as e:
+            logger.warning(f"Failed to generate fresh signed URL for bbox visualization: {str(e)}")
+    
     return ImageQRResult(
         image_name=cached_result['filename'],
         image_url=fresh_signed_url,
         image_coordinates=image_coordinates,
         qr_results=qr_results,
         success=cached_result.get('processing_status') == 'success',
-        error=cached_result.get('error_message')
+        error=cached_result.get('error_message'),
+        bbox_visualization_url=bbox_visualization_url
     )
 
 async def process_single_image(s3_image_url: str) -> ImageQRResult:
@@ -2216,35 +2304,51 @@ async def process_single_image(s3_image_url: str) -> ImageQRResult:
         
         # Process results
         qr_results = []
+        bbox_visualization_url = None
+        
         if isinstance(result, list) and len(result) > 0:
             workflow_result = result[0]
             
             crop_outputs = workflow_result.get('crop_output', [])
             predictions = workflow_result.get('model_predictions', {}).get('predictions', [])
+            bbox_rf_image = workflow_result.get('bounding_box_visualization', [])
             
+            # Debug: Log all available fields in workflow_result
+            logger.info(f"Available workflow result fields: {list(workflow_result.keys())}")
             logger.info(f"Found {len(crop_outputs)} QR code detections in {image_name}")
+            logger.info(f"Bounding box visualization available: {len(bbox_rf_image) if bbox_rf_image else 0} items")
             
-            # Find the crop with the highest confidence
-            best_crop_index = 0
-            best_confidence = 0.0
+            logger.info(f"OCT27DEBUG: IMAGE URL {s3_image_url}")
+            logger.info(f"OCT27DEBUG: {predictions}")
+            logger.info(f"OCT27DEBUG: {len(crop_outputs)}")
+
+            # Process bounding box visualization if available
+            if bbox_rf_image and len(bbox_rf_image) > 0:
+                try:
+                    # Generate a task_id for this single image processing
+                    task_id = str(uuid.uuid4())
+                    # Pass the raw data directly (it's already a list of bytes)
+                    bbox_s3_url = upload_bbox_visualization_to_s3(bbox_rf_image, image_name, task_id)
+                    bbox_visualization_url = get_s3_signed_url(bbox_s3_url)
+                    logger.info(f"✅ Generated bounding box visualization URL: {bbox_visualization_url}")
+                except Exception as e:
+                    logger.warning(f"Failed to upload bounding box visualization: {str(e)}")
             
-            for i, pred in enumerate(predictions):
+            # Process ALL detected QR codes, not just the highest confidence one
+            for i, (crop_base64, pred) in enumerate(zip(crop_outputs, predictions)):
                 confidence = pred.get('confidence', 0.0)
-                if confidence > best_confidence:
-                    best_confidence = confidence
-                    best_crop_index = i
-            
-            logger.info(f"Processing crop {best_crop_index + 1} with highest confidence: {best_confidence:.3f}")
-            
-            # Process only the best crop
-            if best_crop_index < len(crop_outputs):
-                crop_base64 = crop_outputs[best_crop_index]
+                logger.info(f"Processing crop {i + 1} with confidence: {confidence:.3f}")
+                
                 qr_contents = decode_qr_from_base64(crop_base64)
-                print(f"QR contents: {qr_contents}")
+                logger.info(f"OCT27DEBUG: QR contents from crop {i + 1}: {qr_contents}")
+                
                 if qr_contents:
                     for qr_content in qr_contents:
-                        qr_results.append(QRResult(content=qr_content, confidence=best_confidence))
-                        logger.info(f"✅ Decoded QR in {image_name}: {qr_content[:50]}...")
+                        qr_results.append(QRResult(content=qr_content, confidence=confidence))
+                        logger.info(f"✅ Decoded QR in {image_name} (crop {i + 1}): {qr_content[:50]}...")
+                        logger.info(f"OCT27DEBUG: QR content: {qr_content}")
+                else:
+                    logger.warning(f"❌ Failed to decode QR from crop {i + 1} in {image_name}")
         
         # Generate signed URL for the image
         image_signed_url = get_s3_signed_url(s3_image_url)
@@ -2254,7 +2358,8 @@ async def process_single_image(s3_image_url: str) -> ImageQRResult:
             image_url=image_signed_url,
             image_coordinates=image_coordinates,
             qr_results=qr_results,
-            success=True
+            success=True,
+            bbox_visualization_url=bbox_visualization_url
         )
         
     except Exception as e:
@@ -2985,7 +3090,8 @@ async def get_vin_history(vin: str, folder_filter: Optional[str] = None):
                 spotted_at=datetime.fromisoformat(occurrence["spotted_at"].replace('Z', '+00:00')),
                 latitude=occurrence.get("latitude"),
                 longitude=occurrence.get("longitude"),
-                confidence=occurrence["confidence"]
+                confidence=occurrence["confidence"],
+                bbox_visualization_url=occurrence.get("bbox_visualization_url")
             ))
         
         return VINHistoryResponse(
@@ -3109,92 +3215,66 @@ async def detect_apriltag(request: AprilTagDetectionRequest):
             
             # Decode base64
             image_bytes = base64.b64decode(image_data)
-            img = Image.open(io.BytesIO(image_bytes)).convert('L')
+            
+            # Log original image properties
+            img = Image.open(io.BytesIO(image_bytes))
+            logger.info(f"Original image mode: {img.mode}, size: {img.size}")
+            
+            # Use enhanced detection with preprocessing
+            detections = detect_apriltags_enhanced(image_bytes)
+            logger.info(f"Enhanced AprilTag detector found {len(detections)} detections")
             
         except Exception as e:
             logger.error(f"Failed to decode base64 image: {e}")
             raise HTTPException(status_code=400, detail=f"Invalid base64 image data: {str(e)}")
         
-        # Save to temporary PGM file for AprilTag detector
-        with tempfile.NamedTemporaryFile(suffix=".pgm", delete=False) as f:
-            tmp_path = f.name
-        
-        try:
-            img.save(tmp_path)
-            
-            # Run AprilTag detection
-            result = subprocess.run([AT_EXE, tmp_path], 
-                                  capture_output=True, text=True, check=True)
-            
-            # Parse JSON output
-            json_text = '[]'
-            for line in result.stdout.splitlines():
-                idx = line.find('[')
-                if idx != -1:
-                    json_text = line[idx:]
-                    break
-            
-            detections = json.loads(json_text)
-            
-            if not detections:
-                return AprilTagDetectionResponse(
-                    success=True,
-                    detections=[],
-                    total_detections=0,
-                    message="No AprilTags detected in the image"
-                )
-            
-            # Convert to our response format
-            apriltag_detections = []
-            for detection in detections:
-                apriltag_detections.append(AprilTagDetection(
-                    id=detection.get('id', 0),
-                    center=detection.get('center', {'x': 0.0, 'y': 0.0}),
-                    corners=detection.get('corners', []),
-                    confidence=detection.get('confidence', 1.0)
-                ))
-            
-            # Handle binary format if requested
-            binary_data = None
-            if request.format.lower() == "binary":
-                # Convert detections to binary format
-                binary_data = json.dumps([{
-                    'id': det.id,
-                    'center': det.center,
-                    'corners': det.corners,
-                    'confidence': det.confidence
-                } for det in apriltag_detections]).encode('utf-8')
-            
+        if not detections:
             return AprilTagDetectionResponse(
                 success=True,
-                detections=apriltag_detections,
-                total_detections=len(apriltag_detections),
-                message=f"Successfully detected {len(apriltag_detections)} AprilTag(s)",
-                binary_data=binary_data
+                detections=[],
+                total_detections=0,
+                message="No AprilTags detected in the image"
             )
-            
-        except subprocess.CalledProcessError as e:
-            logger.error(f"AprilTag detection failed: {e}")
-            logger.error(f"stderr: {e.stderr}")
-            raise HTTPException(status_code=500, detail=f"AprilTag detection failed: {e.stderr}")
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse AprilTag JSON response: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to parse detection results: {str(e)}")
-        except Exception as e:
-            logger.error(f"AprilTag detection error: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"AprilTag detection error: {str(e)}")
-        finally:
-            # Clean up temporary file
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
-                
-    except HTTPException:
-        raise
+        
+        # Convert to our response format
+        apriltag_detections = []
+        for detection in detections:
+            apriltag_detections.append(AprilTagDetection(
+                id=detection.get('id', 0),
+                center=detection.get('center', {'x': 0.0, 'y': 0.0}),
+                corners=detection.get('corners', []),
+                confidence=detection.get('confidence', 1.0)
+            ))
+        
+        # Handle binary format if requested
+        binary_data = None
+        if request.format.lower() == "binary":
+            # Convert detections to binary format
+            binary_data = json.dumps([{
+                'id': det.id,
+                'center': det.center,
+                'corners': det.corners,
+                'confidence': det.confidence
+            } for det in apriltag_detections]).encode('utf-8')
+        
+        return AprilTagDetectionResponse(
+            success=True,
+            detections=apriltag_detections,
+            total_detections=len(apriltag_detections),
+            message=f"Successfully detected {len(apriltag_detections)} AprilTag(s)",
+            binary_data=binary_data
+        )
+        
+    except subprocess.CalledProcessError as e:
+        logger.error(f"AprilTag detection failed: {e}")
+        logger.error(f"stderr: {e.stderr}")
+        raise HTTPException(status_code=500, detail=f"AprilTag detection failed: {e.stderr}")
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse AprilTag JSON response: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to parse detection results: {str(e)}")
     except Exception as e:
-        logger.error(f"Unexpected error in AprilTag detection: {e}")
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+        logger.error(f"AprilTag detection error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"AprilTag detection error: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
