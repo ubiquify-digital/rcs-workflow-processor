@@ -202,6 +202,7 @@ class VINSummary(BaseModel):
     folders: List[str]
     latest_location: Optional[Dict[str, float]] = None
     ai_description: Optional[str] = None
+    qr_id: Optional[str] = None  # Associated AprilTag/QR code ID
 
 class VINListResponse(BaseModel):
     vins: List[VINSummary]
@@ -913,15 +914,23 @@ def get_vin_summary(vin: str) -> VINSummary:
             "longitude": latest_occurrence["longitude"]
         }
     
-    # Get AI description from qr_codes table
+    # Get AI description and QR ID from qr_codes table
     ai_description = None
+    qr_id = None
     try:
         if supabase:
-            qr_result = supabase.table("qr_codes").select("ai_description").eq("vin", vin).execute()
+            qr_result = supabase.table("qr_codes").select("ai_description, qr_code_id").eq("vin", vin).execute()
             if qr_result.data:
                 ai_description = qr_result.data[0].get("ai_description")
+                qr_id = str(qr_result.data[0].get("qr_code_id")) if qr_result.data[0].get("qr_code_id") else None
     except Exception as e:
-        logger.warning(f"Could not fetch AI description for VIN {vin}: {e}")
+        logger.warning(f"Could not fetch AI description and QR ID for VIN {vin}: {e}")
+    
+    # If no QR ID from qr_codes table, try to get it from the latest occurrence
+    if not qr_id and vin_occurrences:
+        qr_id = latest_occurrence.get("qr_code_id")
+        if qr_id:
+            qr_id = str(qr_id)
     
     return VINSummary(
         vin=vin,
@@ -930,7 +939,8 @@ def get_vin_summary(vin: str) -> VINSummary:
         last_spotted=datetime.fromisoformat(vin_occurrences[-1]["spotted_at"].replace('Z', '+00:00')),
         folders=folders,
         latest_location=latest_location,
-        ai_description=ai_description
+        ai_description=ai_description,
+        qr_id=qr_id
     )
 
 def get_latest_folder_map(folder_filter: Optional[List[str]] = None) -> Optional[MapData]:
@@ -1343,6 +1353,10 @@ def resolve_qr_code_to_vin(qr_content: str) -> Optional[str]:
     """Resolve QR code content (ID) to VIN number"""
     if not qr_content:
         return None
+    
+    # Handle special case for failed crops
+    if qr_content == "NO_APRILTAG":
+        return "Car Detected but No AprilTag Detected"
     
     # Check if the content is already a VIN (17 characters, alphanumeric)
     if len(qr_content) == 17 and qr_content.isalnum():
@@ -2178,14 +2192,17 @@ def store_image_result(task_id: str, s3_image_url: str, image_result: ImageQRRes
                 ]
                 logger.info(f"Found {len(filtered_qr_results)} matching QR results for AprilTag ID {apriltag_id}")
                 
+                # Don't add failed crops to individual AprilTag records
+                # They will be handled separately below
+                
                 record = {
                     'task_id': task_id,
                     'filename': image_result.image_name,
                     's3_input_url': s3_image_url,
                     'image_signed_url': image_result.image_url,
                     'timestamp': datetime.now().isoformat(),
-                    'latitude': realworld_coordinates.get('latitude'),
-                    'longitude': realworld_coordinates.get('longitude'),
+                    'latitude': realworld_coordinates.get('latitude') if realworld_coordinates.get('latitude') else image_result.image_coordinates.get('latitude'),
+                    'longitude': realworld_coordinates.get('longitude') if realworld_coordinates.get('longitude') else image_result.image_coordinates.get('longitude'),
                     'qr_results': filtered_qr_results,  # Only QR results for this specific AprilTag
                     'processing_status': 'success' if image_result.success else 'failed',
                     'error_message': image_result.error,
@@ -2193,6 +2210,29 @@ def store_image_result(task_id: str, s3_image_url: str, image_result: ImageQRRes
                     'bbox_visualization_url': image_result.bbox_visualization_url
                 }
                 records_to_insert.append(record)
+            
+            # Create a separate record for failed crops only (Option B)
+            failed_crops = [
+                qr for qr in qr_results_json 
+                if qr.get('content') == "NO_APRILTAG"
+            ]
+            if failed_crops:
+                logger.info(f"Found {len(failed_crops)} failed crops, creating separate record")
+                failed_record = {
+                    'task_id': task_id,
+                    'filename': image_result.image_name,
+                    's3_input_url': s3_image_url,
+                    'image_signed_url': image_result.image_url,
+                    'timestamp': datetime.now().isoformat(),
+                    'latitude': None,  # No specific location for failed crops
+                    'longitude': None,
+                    'qr_results': failed_crops,
+                    'processing_status': 'success',
+                    'error_message': None,
+                    'processed_at': datetime.now().isoformat(),
+                    'bbox_visualization_url': image_result.bbox_visualization_url
+                }
+                records_to_insert.append(failed_record)
             
             # Insert all records at once
             if records_to_insert:
@@ -2214,6 +2254,9 @@ def store_image_result(task_id: str, s3_image_url: str, image_result: ImageQRRes
                 's3_input_url': s3_image_url,
                 'image_signed_url': image_result.image_url,
                 'timestamp': datetime.now().isoformat(),
+                # SHEHROZ: CAN ADD THE LATITUDE AND LONGITUDE FROM THE IMAGE HERE IF YOU WANT TO USE THE IMAGE COORDINATES INSTEAD OF THE REALWORLD COORDINATES
+                # 'latitude': image_result.image_coordinates.get('latitude') ,
+                # 'longitude': image_result.image_coordinates.get('latitude') ,
                 'latitude': None,
                 'longitude': None,
                 'qr_results': qr_results_json,
@@ -2348,7 +2391,9 @@ async def process_single_image(s3_image_url: str) -> ImageQRResult:
                         logger.info(f"✅ Decoded QR in {image_name} (crop {i + 1}): {qr_content[:50]}...")
                         logger.info(f"OCT27DEBUG: QR content: {qr_content}")
                 else:
-                    logger.warning(f"❌ Failed to decode QR from crop {i + 1} in {image_name}")
+                    # Store failed crop with special marker
+                    qr_results.append(QRResult(content="NO_APRILTAG", confidence=confidence))
+                    logger.info(f"❌ Failed to decode QR from crop {i + 1} in {image_name} - stored as NO_APRILTAG")
         
         # Generate signed URL for the image
         image_signed_url = get_s3_signed_url(s3_image_url)
@@ -3023,15 +3068,23 @@ async def list_all_vins(folder_filter: Optional[str] = None):
                     "longitude": latest_occurrence["longitude"]
                 }
             
-            # Get AI description
+            # Get AI description and QR ID
             ai_description = None
+            qr_id = None
             try:
                 if supabase:
-                    qr_result = supabase.table("qr_codes").select("ai_description").eq("vin", vin).execute()
+                    qr_result = supabase.table("qr_codes").select("ai_description, qr_code_id").eq("vin", vin).execute()
                     if qr_result.data:
                         ai_description = qr_result.data[0].get("ai_description")
+                        qr_id = str(qr_result.data[0].get("qr_code_id")) if qr_result.data[0].get("qr_code_id") else None
             except Exception as e:
-                logger.warning(f"Could not fetch AI description for VIN {vin}: {e}")
+                logger.warning(f"Could not fetch AI description and QR ID for VIN {vin}: {e}")
+            
+            # If no QR ID from qr_codes table, try to get it from the latest occurrence
+            if not qr_id and occurrences:
+                qr_id = latest_occurrence.get("qr_code_id")
+                if qr_id:
+                    qr_id = str(qr_id)
             
             vins.append(VINSummary(
                 vin=vin,
@@ -3040,7 +3093,8 @@ async def list_all_vins(folder_filter: Optional[str] = None):
                 last_spotted=datetime.fromisoformat(occurrences[-1]["spotted_at"].replace('Z', '+00:00')),
                 folders=folders,
                 latest_location=latest_location,
-                ai_description=ai_description
+                ai_description=ai_description,
+                qr_id=qr_id
             ))
         
         # Sort by last spotted (most recent first)
